@@ -59,24 +59,8 @@ import sys
 import unicodedata
 from pathlib import Path
 
-# generador.py lives in entrega/, because that is where the spec requires it
-# and keeping a second copy at the repo root is how you end up EVALUATING one
-# version and SHIPPING another. Import the shipped copy, never a duplicate.
-#
-# Anchored on this file's own directory rather than the working directory, so
-# `python eval.py` works from the repo root, from entrega/, or from anywhere
-# else. If entrega/ has been moved, CODEFEST_ENTREGA points at it.
-_HERE = Path(__file__).resolve().parent
-_ENTREGA = Path(os.environ.get("CODEFEST_ENTREGA") or (_HERE / "entrega"))
-if not (_ENTREGA / "generador.py").exists():
-    raise SystemExit(
-        f"generador.py not found at {_ENTREGA / 'generador.py'}\n"
-        f"  eval.py imports the SHIPPED retrieval code so the numbers it "
-        f"prints describe\n  the pipeline you actually submit. Put "
-        f"generador.py in entrega/, or set\n  CODEFEST_ENTREGA=/path/to/entrega")
-sys.path.insert(0, str(_ENTREGA))
 
-from generador import (GraphIndex, LexicalIndex, RetrievalConfig,   # noqa: E402
+from entrega.generador import (GraphIndex, LexicalIndex, RetrievalConfig,   # noqa: E402
                        VectorStore, add_retrieval_args, aggregate_documents,
                        aggregate_documents_rankdecay, config_from_args,
                        load_stores, read_jsonl, retrieve)

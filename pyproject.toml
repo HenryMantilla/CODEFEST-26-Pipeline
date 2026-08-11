@@ -27,6 +27,9 @@ dependencies = [
     #     by hand, and any `uv sync` would have removed it mid-project.
     "rapidocr>=3.0.0",            # >=3.0 for Det/Cls/Rec .engine_type
     "onnxruntime>=1.20",          # rapidocr's default execution provider
+    "py3langid>=0.3.0",
+    "gliner>=0.2.28",
+    "networkx>=3.6.1",
 ]
 
 [project.optional-dependencies]
