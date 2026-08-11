@@ -1,0 +1,93 @@
+[project]
+name = "code-adastra"
+version = "0.1.0"
+description = "CODEFEST AD ASTRA 2026 — Etapa 1, base de conocimiento"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+
+dependencies = [
+    # --- retrieval core
+    "torch==2.13.0",              # PINNED: see rule 1 above
+    "sentence-transformers>=5.6.1",
+    "faiss-cpu>=1.15.0",          # IndexFlatIP + write_index only; the build
+                                  # makes no GPU FAISS calls, and the jury
+                                  # installs faiss-cpu per entrega/README.md
+    "numpy>=2.4.6",
+
+    # --- extraction
+    "pymupdf>=1.28.0",            # PDF text, geometry, rasterising for OCR
+    "pysbd>=0.3.4",               # sentence segmentation (chunking.py)
+    "ftfy>=6.3.1",                # mojibake repair (extraction.py clean())
+    "beautifulsoup4>=4.15.0",     # HTML
+    "lxml>=6.1.1",                # bs4 parser backend
+    "pandas>=3.0.5",              # CSV / XLSX
+    "openpyxl>=3.1.5",            # XLSX, inventory, ground truth, pool.xlsx
+    "pillow>=12.3.0",             # image handling for the OCR path
+
+    # --- OCR. rapidocr is the DEFAULT backend and was missing from this
+    #     file entirely: it survived only because it had been pip-installed
+    #     by hand, and any `uv sync` would have removed it mid-project.
+    "rapidocr>=3.0.0",            # >=3.0 for Det/Cls/Rec .engine_type
+    "onnxruntime>=1.20",          # rapidocr's default execution provider
+]
+
+[project.optional-dependencies]
+
+# Knowledge graph, Section 7 (bonus). Optional because --ner heuristic builds
+# it with no model at all, which is the path that works when transformers
+# fights the environment.
+grafo = [
+    "networkx>=3.3",              # build only; generador.py reads GraphML
+                                  # with xml.etree and needs nothing here
+    "transformers>=4.44",
+    "sentencepiece>=0.2.0",       # XLM-R ships only the slow tokenizer;
+                                  # without this, transformers falls back to
+                                  # tiktoken and dies parsing a protobuf
+]
+
+# Docling layout extraction. Kept OUT of the core: it pulls its own torch
+# pins, and the measured verdict was --docling off (PyMuPDF 3.50 vs Docling
+# 3.71 excess alternations, with Docling emitting 50-84% of the text on four
+# of ten files). Install only to reproduce that comparison.
+docling = [
+    "docling>=2.119.0",
+]
+
+# Everything below is for experiments that are not in the shipping pipeline.
+dev = [
+    "psutil>=5.9",                # memory reporting in build_index
+    "pdfplumber>=0.11.10",        # cross-checking PyMuPDF extraction
+]
+
+# ============================================================================
+# REMOVED, AND WHY — so nobody adds them back next week
+#
+#   faiss-gpu           Collides with faiss-cpu on the same package path.
+#                       The build uses IndexFlatIP and write_index; there is
+#                       no GPU FAISS call anywhere in it.
+#
+#   paddlepaddle-gpu    THE SOURCE OF THE CUDA-12 WHEELS. Its GPU builds pin
+#   paddleocr           nvidia-*-cu12, which sat beside torch's cu13 set and
+#                       shared install paths for nccl / cudnn / nvshmem /
+#                       cusparselt. Not used: the OCR backend is rapidocr.
+#
+#   pytesseract         Alternative OCR backend, never selected. Add back
+#                       only with the tesseract binary and language packs.
+#
+#   tiktoken            Arrived while chasing the sentencepiece error. It is
+#                       transformers' FALLBACK tokenizer converter, not a
+#                       dependency of anything here.
+#
+#   mapbox-vector-tile  .pbf tiles are excluded from the index (their content
+#   mercantile          is already in AMAZONUW_amazonunderworld-data.csv), so
+#                       pbf_extract.py is dead code.
+#
+# After editing:  uv lock && uv sync
+#   python -c "import torch, faiss; print(torch.__version__, torch.cuda.is_available())"
+#   python tools/diagnose_nccl.py
+# ============================================================================
+
+[tool.uv]
+# Never let a resolution move torch: a different torch means a different set
+# of nvidia-* wheels, and those collide on disk rather than coexisting.
+override-dependencies = ["torch==2.13.0"]
