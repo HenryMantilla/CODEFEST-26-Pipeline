@@ -78,7 +78,8 @@ sys.path.insert(0, str(_ENTREGA))
 
 from generador import (GraphIndex, LexicalIndex, RetrievalConfig,   # noqa: E402
                        VectorStore, add_retrieval_args, aggregate_documents,
-                       config_from_args, load_stores, read_jsonl, retrieve)
+                       aggregate_documents_rankdecay, config_from_args,
+                       load_stores, read_jsonl, retrieve)
 
 NGRAM = 8                 # word n-gram size for fragment matching
 ID_NGRAM = 5              # smaller n for matching GT questions to official ids
@@ -293,6 +294,30 @@ def reciprocal_rank(hits: list[bool]) -> float:
 
 # ------------------------------------------------- evaluation
 
+def _aggregate(doc_ranking, n, pool, cfg: RetrievalConfig):
+    """
+    FIX: mirrors generador.py main()'s dispatch on cfg.doc_score exactly.
+
+    Before this fix, evaluate() called aggregate_documents() (the old
+    cosine/CombSUM aggregator) unconditionally, regardless of cfg.doc_score.
+    That was harmless when doc_score defaulted to "cosine", but the default
+    is now "rankdecay" (see generador.py's RetrievalConfig docstring), under
+    which retrieve() returns doc_ranking as raw RRF-space scores rather than
+    cosine/CombSUM ones. Feeding RRF-space scores (~0.003-0.017) into
+    aggregate_documents()'s max-pooling and hit_bonus -- both calibrated
+    against a cosine spread of ~0.11 or a CombSUM spread of ~3.0 -- silently
+    produces a document ranking that has no relationship to the one
+    resultados.jsonl actually ships, which is exactly the "measuring a
+    different system than you ship" failure this module's own docstring
+    warns about. Every call site that aggregates result.doc_ranking must go
+    through this function, not aggregate_documents() directly.
+    """
+    if cfg.doc_score == "rankdecay":
+        return aggregate_documents_rankdecay(doc_ranking, n, pool, cfg.doc_decay)
+    return aggregate_documents(doc_ranking, n, pool, cfg.doc_hit_bonus,
+                               cfg.doc_hit_cap, cfg.doc_agg, cfg.doc_top_m)
+
+
 def evaluate(gt, stores, cfg: RetrievalConfig, lexical, graph, frag_threshold: float,
              doc_k: int, frag_k: int, show_misses: bool,
              show_fragments: int, show_docs: bool) -> None:
@@ -301,7 +326,9 @@ def evaluate(gt, stores, cfg: RetrievalConfig, lexical, graph, frag_threshold: f
 
     Ranking goes through generador.retrieve() and the CLI is built from
     generador.add_retrieval_args(), so there is exactly one place where a
-    default can be changed and it changes both sides at once.
+    default can be changed and it changes both sides at once. Document
+    aggregation goes through _aggregate(), for the same reason -- see its
+    docstring.
     """
     rows = []
 
@@ -311,8 +338,7 @@ def evaluate(gt, stores, cfg: RetrievalConfig, lexical, graph, frag_threshold: f
 
         # ---- document level: aggregate over the same list main() uses
         wanted = [norm_doc(d) for d in entry["documents"] if d]
-        ranked_docs = aggregate_documents(result.doc_ranking, doc_k, cfg.doc_pool,
-                                          cfg.doc_hit_bonus, cfg.doc_hit_cap)
+        ranked_docs = _aggregate(result.doc_ranking, doc_k, cfg.doc_pool, cfg)
         by_doc_id = {m["doc_id"]: m for m, _ in result.doc_ranking}
 
         def matches(doc_id: str) -> bool:
@@ -334,15 +360,13 @@ def evaluate(gt, stores, cfg: RetrievalConfig, lexical, graph, frag_threshold: f
         # GT document just outside that would report as [] -- indistinguishable
         # from "never retrieved". The shipped top-3 still uses cfg.doc_pool;
         # this is only the ruler.
-        full_docs = aggregate_documents(result.doc_ranking, None,
-                                        len(result.doc_ranking),
-                                        cfg.doc_hit_bonus, cfg.doc_hit_cap)
+        full_docs = _aggregate(result.doc_ranking, None,
+                               len(result.doc_ranking), cfg)
         doc_ranks = [i for i, d in enumerate(full_docs, 1) if matches(d)]
 
         # Rank under the SHIPPED pool too, so the gap between "the ranker
         # knows" and "the aggregation kept it" is visible.
-        pooled = aggregate_documents(result.doc_ranking, None, cfg.doc_pool,
-                                     cfg.doc_hit_bonus, cfg.doc_hit_cap)
+        pooled = _aggregate(result.doc_ranking, None, cfg.doc_pool, cfg)
         pooled_ranks = [i for i, d in enumerate(pooled, 1) if matches(d)]
 
         # ---- fragment level
@@ -702,10 +726,13 @@ def main() -> None:
     stores = load_stores(args.index_dir, args.doc_encoder, cfg.doc_score)
     print(f"evaluar  : build 2026-08-08d (reports gt_doc_rank / gt_frag_rank)")
     print(f"Encoders : {[s.name for s in stores]}")
-    print(f"Documents: {cfg.doc_score}, pool={cfg.doc_pool}, "
-          f"hit +{cfg.doc_hit_bonus:.0%} x{cfg.doc_hit_cap}")
+    print(f"Documents: {cfg.doc_score}"
+          + (f", decay={cfg.doc_decay}" if cfg.doc_score == "rankdecay"
+             else f", pool={cfg.doc_pool}, hit +{cfg.doc_hit_bonus:.0%} "
+                  f"x{cfg.doc_hit_cap}"))
     print(f"Fragments: dedupe>={cfg.dedupe_threshold}, "
-          f"phenomenon x{1 + cfg.phenomenon_boost:.2f}, bm25 w={cfg.bm25_weight}"
+          f"phenomenon {cfg.phenomenon_mode} {cfg.phenomenon_boost}, "
+          f"bm25 w={cfg.bm25_weight}"
           + (f", reranker={cfg.reranker}" if cfg.reranker else ""))
     check_doc_ids(stores[0])
 

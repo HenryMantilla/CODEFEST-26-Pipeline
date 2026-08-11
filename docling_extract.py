@@ -273,6 +273,7 @@ def docling_one_file(path: Path, root: Path, doc_id: str, phenomenon: int,
     import os
 
     from chunking import chunk_text_units
+    from extraction import guess_title
     from layout import split_spreads
 
     target, page_map, note_prefix = path, None, ""
@@ -311,10 +312,15 @@ def docling_one_file(path: Path, root: Path, doc_id: str, phenomenon: int,
     if not units:
         return [], f"{note_prefix}no usable units"
 
+    # FIX: filename-derived title (units already carry their own heading
+    # trail via unit.context_prefix(); this only adds the document-level
+    # anchor, same reasoning as the rich_layout path in build_index.py).
+    doc_title = guess_title("", path.name)
     chunks = chunk_text_units(
         units, doc_id=doc_id, source=str(path.relative_to(root)),
         phenomenon=phenomenon, count_tokens=count_tokens,
         file_name=path.name, official_doc_id=doc_id,
-        max_chars=max_chars, overlap_chars=overlap_chars)
+        max_chars=max_chars, overlap_chars=overlap_chars,
+        doc_title=doc_title)
 
     return [c.to_dict() for c in chunks], ""

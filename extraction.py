@@ -68,6 +68,13 @@ class Document:
     file_name: str = ""          # bare original filename (hedge, see chunking)
     official_doc_id: str = ""    # DOC_ID from Indice_Datos_Codefest.xlsx
     extra: dict[str, Any] = field(default_factory=dict)
+    # FIX: document-level title, threaded through to chunking.py's
+    # Chunk.titulo and embedded ahead of the heading trail. Comes from a
+    # JSON `title`/`titulo` field when the source has one, from the
+    # alertas_tempranas alert code + municipios when it doesn't (the raw
+    # `title` there is always the literal string "Mapa" -- useless), or from
+    # a cleaned-up filename as the last resort. Empty string is always safe.
+    title: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -333,6 +340,33 @@ TEXT_FIELDS = ("title", "titulo", "headline", "summary", "abstract", "resumen",
 META_FIELDS = ("url", "link", "date", "fecha", "published", "authors", "autor",
                "autores", "tags", "keywords", "source", "fuente", "lang", "idioma")
 
+# FIX: which TEXT_FIELDS names are the SAME content reshaped, not different
+# content. A source that ships both `body_text` and `content` (or `text`
+# and `texto`) is the common case, not the exception, and the old loop
+# concatenated every one that was present -- doubling that paragraph in the
+# index and inflating its match score for every query it happens to answer.
+# Once one of these has been added, the rest are skipped; head fields
+# (title, summary, abstract...) are never deduped against them, since a
+# summary genuinely adds information a body does not restate verbatim.
+_BODY_FIELDS = {"body_text", "body", "content", "contenido", "text", "texto",
+                "body_paragraphs", "paragraphs", "parrafos"}
+
+
+def guess_title(text: str, file_name: str) -> str:
+    """
+    Best-effort document title when the source format has no real one.
+
+    Order: first non-trivial line of the extracted text, then a cleaned-up
+    version of the filename. Never raises, never returns something that
+    would make embedding_text() worse than having no title at all (the
+    length/emptiness checks are what protect against that).
+    """
+    first_line = text.strip().split("\n", 1)[0].strip()
+    if 10 < len(first_line) < 150:
+        return first_line
+    stem = Path(file_name).stem
+    return re.sub(r"[_\-]+", " ", stem).strip()
+
 
 def _flatten(value: Any) -> str:
     """Join lists of paragraphs while preserving their order."""
@@ -367,7 +401,21 @@ def _alertas_tempranas(data: dict) -> tuple[str, dict] | None:
 
     body = _flatten(data.get("body_paragraphs") or []).strip()
     text = "\n\n".join(p for p in [". ".join(header), body] if p)
-    return text, {k: v for k, v in meta_block.items() if v}
+    meta = {k: v for k, v in meta_block.items() if v}
+
+    # FIX: the raw `title` field on these 363 records is always the literal
+    # string "Mapa" -- worthless as embedding context, and worse, it makes
+    # every alert in the same municipality embed with an identical, useless
+    # prefix. The alert code + municipalities is what actually distinguishes
+    # one from another and is exactly what q041-q044 ask about.
+    code = str(meta_block.get("codigo", "")).strip()
+    municipios = str(meta_block.get("municipios", "")).strip()
+    label = " — ".join(p for p in (f"Alerta {code}" if code else "", municipios)
+                       if p)
+    if label:
+        meta["_titulo"] = label
+
+    return text, meta
 
 
 # CENIA (15 files) uses sections[{heading, paragraphs[]}] and has no body_text.
@@ -392,7 +440,9 @@ def extract_json(path: Path) -> tuple[str, dict]:
     """
     Section 2.1: explicitly select the text fields and concatenate them in
     order; descriptive fields go to metadata, NOT into the body text.
-    Returns (text, metadata).
+    Returns (text, metadata). `metadata["_titulo"]`, when present, is the
+    document title and is pulled out (not indexed as a corpus field) by
+    load_document() below.
 
     Three corpus-specific schemas are handled before the generic path,
     because the generic path produces near-useless text for all three.
@@ -407,17 +457,34 @@ def extract_json(path: Path) -> tuple[str, dict]:
             return clean(result[0]), result[1]
 
     parts, meta = [], {}
+    body_found = False                               # FIX: dedup, see below
     for field_name in TEXT_FIELDS:                  # canonical order
+        if field_name in _BODY_FIELDS and body_found:
+            # FIX: body_text/body/content/text/texto/body_paragraphs are
+            # commonly the SAME article body reshaped for different
+            # observatories' scrapers. Once the first one is captured, the
+            # rest are almost always a duplicate, not new information --
+            # concatenating them was inflating that paragraph's weight in
+            # the index and its match score for whatever it happens to
+            # answer. Head fields (title/summary/abstract/...) are exempt:
+            # those genuinely add information a body does not restate.
+            continue
         if data.get(field_name):
             value = _flatten(data[field_name]).strip()
             if value:
                 parts.append(value)
+                if field_name in _BODY_FIELDS:
+                    body_found = True
     for field_name in META_FIELDS:
         if data.get(field_name):
             meta[field_name] = data[field_name]
 
     if not parts:                                   # unknown schema
         parts.append(_flatten(data))
+
+    title = str(data.get("title") or data.get("titulo") or "").strip()
+    if title:
+        meta["_titulo"] = title
 
     return clean("\n\n".join(parts)), meta
 
@@ -557,9 +624,16 @@ def load_document(path: Path, doc_id: str, phenomenon: int = 0,
     if len(text.split()) < minimum:      # empty or unreadable document
         return None
 
+    # FIX: title, threaded to chunking.py so every chunk's embedding text
+    # carries which document it came from (see Chunk.embedding_text). Pulled
+    # out of `extra` -- `_titulo` is not a corpus metadata field, it is
+    # consumed here and must not leak into `doc_id_oficial`-style extras.
+    title = meta.pop("_titulo", "") or guess_title(text, path.name)
+
     return Document(doc_id=doc_id, source=path.name, file_format=file_format,
                     text=text, phenomenon=phenomenon, file_name=path.name,
-                    official_doc_id=official_doc_id or doc_id, extra=meta)
+                    official_doc_id=official_doc_id or doc_id, extra=meta,
+                    title=title)
 
 
 # triage class -> extraction mode.

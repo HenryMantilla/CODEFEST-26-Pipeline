@@ -120,14 +120,35 @@ class RetrievalConfig:
     dedupe_window: int = 200
 
     # metadata post-filter (8.7)
-    phenomenon_boost: float = 0.08       # multiplicative, RRF space
+    # FIX: fragments used mode="multiply" at 0.08 -- in RRF space (scores
+    # ~0.016) that is worth about five rank positions, which measured out to
+    # an 18% off-phenomenon leakage rate in the pooled candidates and near
+    # zero difference against the "no phenomenon" ablation (Jaccard 0.98
+    # between the two). Switched fragments to the same span-scaled "add"
+    # mode documents already use, so one number means the same thing in
+    # both places (see apply_phenomenon_boost's docstring on why "multiply"
+    # does not port between score spaces). phenomenon_mode is a new flag so
+    # the old multiplicative behaviour is still reachable for ablation.
+    phenomenon_boost: float = 0.20       # fraction of the RRF pool's score span
+    phenomenon_mode: str = "add"         # add | multiply -- add is span-scaled
     phenomenon_boost_doc: float = 0.30   # ADDITIVE, as a FRACTION of the score span
 
     # lexical channel
-    bm25_weight: float = 1.0
+    # FIX (measured on pool.xlsx): bm25/graph and the dense encoders got
+    # equal weight (1.0 each) in RRF, but BM25 and the graph's typed
+    # relations only ever fire on same-language token overlap -- Spanish
+    # queries against a 74%-English corpus. A chunk that matches in Spanish
+    # gets a vote from every channel; a chunk that only a dense encoder can
+    # cross-lingually match gets fewer votes purely because of language, not
+    # relevance. Measured result: 79% of retrieved fragments were Spanish
+    # against a 74%-English corpus. Down-weighting to 0.5 does not remove
+    # the lexical signal (still valuable for acronyms and place names -- see
+    # the module docstring) but stops it outvoting cross-lingual dense
+    # matches by sheer channel count. Re-sweep if the encoder mix changes.
+    bm25_weight: float = 0.5
     bm25_k1: float = 1.2
     bm25_b: float = 0.75
-    graph_weight: float = 1.0   # 0 disables the graph channel
+    graph_weight: float = 0.5   # 0 disables the graph channel; see bm25_weight
     graph_neighbour: float = 0.4
     rm3_terms: int = 0          # 0 disables pseudo-relevance feedback
     rm3_feedback: int = 10
@@ -135,7 +156,26 @@ class RetrievalConfig:
     mmr_lambda: float = 1.0     # 1.0 disables diversification
 
     # document aggregation (8.6)
-    doc_score: str = "cosine"            # combsum | cosine -- see main docstring
+    # FIX: default was "cosine", which means documents are ranked by
+    # stores[0]'s single best chunk -- and stores[0] is whichever encoder
+    # sorts first ALPHABETICALLY unless --doc-encoder is passed (see
+    # load_stores()'s own docstring calling this "an arbitrary basis for a
+    # scored decision"). Combined with doc_agg="max" (which the docstring
+    # below already documents as making --doc-pool a no-op), document
+    # ranking was decided by one lucky top-2 chunk from one arbitrarily-
+    # chosen encoder, ignoring BM25 and the graph channel entirely at the
+    # document level. Measured: q018/q019/q026 each had ~50% of their
+    # candidate pool concentrated in a single document.
+    #
+    # New default "rankdecay" aggregates documents from the SAME fused,
+    # phenomenon-boosted, reranked candidate list used for fragments,
+    # scoring each document by reciprocal rank of its chunks' POSITIONS in
+    # that list with a per-chunk decay (see aggregate_documents_rankdecay).
+    # This uses every channel's agreement, not one encoder's raw cosine, and
+    # removes the alphabetical-encoder dependency entirely. "combsum" and
+    # "cosine" stay available for ablation against the old behaviour.
+    doc_score: str = "rankdecay"     # rankdecay | combsum | cosine
+    doc_decay: float = 0.85          # per-chunk decay for rankdecay, see below
     doc_pool: int = 30
     doc_agg: str = "max"
     doc_top_m: int = 3
@@ -168,8 +208,15 @@ def add_retrieval_args(parser: argparse.ArgumentParser) -> None:
                              "boilerplate ~0.95. Below 0.31 you start "
                              "suppressing neighbours; sweep it.")
     parser.add_argument("--phenomenon-boost", type=float, default=d.phenomenon_boost,
-                        help="Multiplicative bonus in RRF space for chunks "
-                             "whose `fenomeno` matches the query-id range.")
+                        help="Bonus for chunks whose `fenomeno` matches the "
+                             "query-id range, in the space set by "
+                             "--phenomenon-mode.")
+    parser.add_argument("--phenomenon-mode", choices=["add", "multiply"],
+                        default=d.phenomenon_mode,
+                        help="add (default) = span-scaled, same unit as "
+                             "--phenomenon-boost-doc. multiply = old "
+                             "behaviour, kept for ablation only -- see "
+                             "apply_phenomenon_boost().")
     parser.add_argument("--phenomenon-boost-doc", type=float,
                         default=d.phenomenon_boost_doc,
                         help="Bonus in cosine/CombSUM space, expressed as a "
@@ -200,8 +247,19 @@ def add_retrieval_args(parser: argparse.ArgumentParser) -> None:
                              "list. 1.0 = off. Lower trades relevance for "
                              "coverage, which is what nDCG@10 rewards when a "
                              "query has several relevant passages.")
-    parser.add_argument("--doc-score", choices=["combsum", "cosine"], default=d.doc_score,
-                        help="Score space documents are aggregated over (8.6).")
+    parser.add_argument("--doc-score", choices=["rankdecay", "combsum", "cosine"],
+                        default=d.doc_score,
+                        help="Score space documents are aggregated over (8.6). "
+                             "rankdecay (default, see RetrievalConfig for why) "
+                             "ignores --doc-pool/--doc-agg/--doc-hit-* entirely "
+                             "and uses --doc-decay instead; combsum/cosine are "
+                             "kept for ablation against the old behaviour and "
+                             "use the doc-pool/doc-agg/hit-bonus knobs below.")
+    parser.add_argument("--doc-decay", type=float, default=d.doc_decay,
+                        help="rankdecay only: weight of a document's i-th "
+                             "ranked chunk is doc_decay**i. Lower rewards "
+                             "breadth less; 1.0 makes every chunk count "
+                             "equally (closer to old doc_agg='sum').")
     parser.add_argument("--doc-agg", choices=["max", "sum", "mean", "rrf"],
                         default=d.doc_agg,
                         help="how a document's chunk scores become one score "
@@ -524,12 +582,14 @@ def load_stores(index_dir: Path, doc_encoder: str = "",
         if doc_encoder.lower() not in stores[0].name.lower():
             print(f"  WARNING: no index matches --doc-encoder {doc_encoder!r}; "
                   f"leading with {stores[0].name}")
-        if doc_score == "combsum":
+        if doc_score in ("combsum", "rankdecay"):
             print(f"  WARNING: --doc-encoder {doc_encoder!r} has NO EFFECT "
-                  f"under --doc-score combsum. CombSUM adds normalised scores "
-                  f"from every channel and addition is commutative, so which "
-                  f"encoder leads is irrelevant; stores[0] is only consulted "
-                  f"by --doc-score cosine. Results here will be identical to "
+                  f"under --doc-score {doc_score}. combsum adds normalised "
+                  f"scores from every channel and rankdecay aggregates from "
+                  f"the fused fragment ranking directly -- in both cases "
+                  f"addition/fusion is commutative, so which encoder leads "
+                  f"is irrelevant; stores[0] is only consulted by "
+                  f"--doc-score cosine. Results here will be identical to "
                   f"any other --doc-encoder value.")
 
     sizes = {s.index.ntotal for s in stores}
@@ -1197,6 +1257,71 @@ def aggregate_documents(ranking: list[tuple[dict, float]], n: int | None = 3,
     return ordered[:n]
 
 
+def aggregate_documents_rankdecay(ranking: list[tuple[dict, float]],
+                                  n: int | None = 3, pool: int = 30,
+                                  decay: float = 0.85,
+                                  rrf_k: int = RRF_K) -> list[str]:
+    """
+    FIX (replaces the cosine/combsum default -- see RetrievalConfig.doc_score).
+
+    Aggregates documents from the FUSED FRAGMENT RANKING directly -- the
+    same phenomenon-boosted, reranked candidate list `build_fragments()`
+    draws the ten returned fragments from -- instead of a separately
+    computed cosine or CombSUM ranking. A document's score is the sum, over
+    its chunks in this list, of that chunk's reciprocal rank discounted by
+    how many of the document's OWN chunks came before it:
+
+        score(d) = sum_i  1/(rrf_k + rank_i + 1) * decay**i
+
+    where `rank_i` is the chunk's position (0-based) in `ranking` and `i` is
+    its position among the document's own chunks, sorted best-first.
+
+    WHY THIS FIXES THE OLD DEFAULT'S THREE PROBLEMS AT ONCE.
+      1. No arbitrary encoder. `ranking` is the fused, multi-channel list
+         every fragment comes from -- BM25, the graph and every dense
+         encoder already voted on it via fuse_rrf(). There is no
+         "stores[0]" or --doc-encoder to get wrong.
+      2. --doc-pool is no longer a no-op. Because the score is a SUM with
+         decay, not a max, a document that is broadly relevant (several
+         good chunks at ranks 40-90) can still outscore one with a single
+         lucky chunk at rank 2 -- the old max-pooling default could never
+         do this regardless of --doc-pool.
+      3. One score space, not two. Fragments and documents are now the same
+         underlying ranking with two different aggregations, rather than
+         two independently-tuned pipelines that can (and did) disagree
+         about which documents matter.
+
+    `decay` trades breadth against a single strong hit: 1.0 makes every
+    chunk count equally (closest to the old doc_agg="sum"); lower values
+    concentrate credit on a document's best 2-3 chunks. 0.85 is a starting
+    point, not a measured optimum -- sweep it against F1@3 like any other
+    knob here.
+    """
+    per_doc: dict[str, list[int]] = defaultdict(list)
+    for rank, (meta, _score) in enumerate(ranking[:pool]):
+        per_doc[meta["doc_id"]].append(rank)
+
+    scores: dict[str, float] = {}
+    for doc_id, ranks in per_doc.items():
+        scores[doc_id] = sum(
+            (1.0 / (rrf_k + rank + 1)) * (decay ** i)
+            for i, rank in enumerate(sorted(ranks)))
+
+    ordered = [d for d, _ in sorted(scores.items(), key=lambda kv: -kv[1])]
+
+    if n is None:                       # full ranking, for diagnostics
+        return ordered
+
+    # 9.3.2: exactly 3 documents or the line is discarded.
+    if len(ordered) < n:
+        for meta, _score in ranking:
+            if meta["doc_id"] not in ordered:
+                ordered.append(meta["doc_id"])
+            if len(ordered) >= n:
+                break
+    return ordered[:n]
+
+
 def build_fragments(candidates: list[tuple[dict, float]], n: int = 10) -> list[dict]:
     """
     Top-n fragments. 9.2.1: a chunk over 250 words is split into complete
@@ -1280,23 +1405,32 @@ def retrieve(stores: list[VectorStore], query: str, query_id: str = "",
     rankings = [r for _n, r in channels]
     phenomenon = expected_phenomenon(query_id)
 
-    # ---- documents: score space with spread (8.6)
-    if cfg.doc_score == "cosine":
-        doc_ranking = rankings[0]
-    else:
-        doc_ranking = fuse_combsum(rankings, weights)
-    doc_ranking = apply_phenomenon_boost(
-        doc_ranking, phenomenon, cfg.phenomenon_boost_doc, mode="add")
-
     # ---- fragments: rank space, robust to incomparable score scales (8.4)
     candidates = fuse_rrf(rankings, weights) if len(rankings) > 1 else rankings[0]
     candidates = apply_phenomenon_boost(
-        candidates, phenomenon, cfg.phenomenon_boost, mode="multiply")
+        candidates, phenomenon, cfg.phenomenon_boost, mode=cfg.phenomenon_mode)
 
     if cfg.reranker:
         candidates = rerank(candidates, query, cfg.reranker,
                             cfg.rerank_depth, cfg.rerank_blend,
                             cfg.rerank_context)
+
+    # ---- documents (8.6)
+    # FIX: "rankdecay" (default) reuses THIS SAME fused, phenomenon-boosted,
+    # reranked list -- every channel already voted on it -- instead of a
+    # second, independently-computed cosine/CombSUM ranking that depended on
+    # which encoder happened to load first. See aggregate_documents_rankdecay
+    # and RetrievalConfig.doc_score for the full reasoning. "combsum"/
+    # "cosine" recompute the old separate ranking for ablation.
+    if cfg.doc_score == "rankdecay":
+        doc_ranking = candidates
+    elif cfg.doc_score == "cosine":
+        doc_ranking = apply_phenomenon_boost(
+            rankings[0], phenomenon, cfg.phenomenon_boost_doc, mode="add")
+    else:
+        doc_ranking = apply_phenomenon_boost(
+            fuse_combsum(rankings, weights), phenomenon,
+            cfg.phenomenon_boost_doc, mode="add")
 
     unique = deduplicate(candidates, cfg.dedupe_threshold,
                          window=cfg.dedupe_window)
@@ -1398,7 +1532,7 @@ def main() -> None:
     print(f"Documents: {cfg.doc_score} space, pool={cfg.doc_pool}, "
           f"hit bonus +{cfg.doc_hit_bonus:.0%} x{cfg.doc_hit_cap}")
     print(f"Fragments: RRF k={RRF_K}, dedupe>={cfg.dedupe_threshold}, "
-          f"phenomenon x{1 + cfg.phenomenon_boost:.2f}"
+          f"phenomenon {cfg.phenomenon_mode} {cfg.phenomenon_boost}"
           + (f", reranker={cfg.reranker}" if cfg.reranker else ""))
 
     lexical = None
@@ -1433,10 +1567,14 @@ def main() -> None:
                 # Never ship a short list: 9.3.2 discards the line.
                 fragments = build_fragments(result.candidates, 10)
 
-            documents = aggregate_documents(
-                result.doc_ranking, 3, cfg.doc_pool,
-                cfg.doc_hit_bonus, cfg.doc_hit_cap,
-                cfg.doc_agg, cfg.doc_top_m)
+            documents = (
+                aggregate_documents_rankdecay(
+                    result.doc_ranking, 3, cfg.doc_pool, cfg.doc_decay)
+                if cfg.doc_score == "rankdecay" else
+                aggregate_documents(
+                    result.doc_ranking, 3, cfg.doc_pool,
+                    cfg.doc_hit_bonus, cfg.doc_hit_cap,
+                    cfg.doc_agg, cfg.doc_top_m))
 
             fh.write(json.dumps({
                 "query_id": query_id,

@@ -153,15 +153,31 @@ class Chunk:
     # extra fields, so emit both and cover either criterion.
     file_name: str = ""            # -> nombre_archivo
     official_doc_id: str = ""      # -> doc_id_oficial
+    # FIX (merge item: adopted from the comparison pipeline's
+    # build_embed_text()). The heading trail alone identifies a SECTION, not
+    # a DOCUMENT: a CEEEP abstract with no heading at all embeds as bare,
+    # generic prose and becomes a "magnet chunk" that a dense encoder matches
+    # to a dozen unrelated queries (measured: one CEEEP abstract chunk
+    # surfaced in 12 of 16 Fenomeno-1 queries in the pooled candidates).
+    # Prepending the document title gives the encoder the one signal a
+    # heading trail cannot: which REPORT this text came from. Never folded
+    # into `texto` -- Table 1 requires that field untouched -- it only
+    # affects the text that gets embedded.
+    titulo: str = ""                # -> extra field `titulo`; NOT in `texto`
 
     def embedding_text(self) -> str:
         """
-        What actually gets encoded. The heading path is prepended so a chunk
-        reading "Cooperative and competitive games have been well-studied..."
-        still matches a query about HAI seed grants -- the words "seed grant"
-        appear nowhere in that paragraph, only in the heading above it.
+        What actually gets encoded. Document title, then heading path, then
+        the fragment text -- so a chunk reading "Cooperative and competitive
+        games have been well-studied..." still matches a query about HAI
+        seed grants (the words "seed grant" appear nowhere in the paragraph,
+        only in the heading above it), AND a short, headingless abstract
+        stays anchored to the report it came from instead of floating free
+        as generic prose that matches everything.
         """
-        return f"{self.context}. {self.text}" if self.context else self.text
+        prefix = " — ".join(p for p in (self.titulo.strip(), self.context.strip())
+                            if p)
+        return f"{prefix}. {self.text}" if prefix else self.text
 
     def to_dict(self) -> dict:
         """
@@ -223,6 +239,7 @@ class Chunk:
             # reaches for, it resolves to the same document.
             "nombre_archivo": name,
             "doc_id_oficial": self.official_doc_id,
+            "titulo": self.titulo,
         }
         if self.source and self.source != name:
             record["ruta_relativa"] = self.source
@@ -300,6 +317,11 @@ def chunk_document(
 
     file_name = getattr(doc, "file_name", "") or ""
     official = getattr(doc, "official_doc_id", "") or ""
+    # FIX: document-level title, when the extractor found one (JSON title,
+    # PDF first heading, or a cleaned-up filename fallback -- see
+    # extraction.py's guess_title()). Empty string is safe and backward
+    # compatible: embedding_text() just drops it from the prefix.
+    doc_title = (getattr(doc, "title", "") or "").strip()
 
     chunks: list[Chunk] = []
     buffer: list[str] = []
@@ -334,6 +356,7 @@ def chunk_document(
             text=text,
             file_name=file_name,
             official_doc_id=official,
+            titulo=doc_title,
         ))
         position += 1
 
@@ -441,7 +464,8 @@ def split_to_250_words(text: str, limit: int = 250) -> list[str]:
 def chunk_text_units(units, doc_id: str, source: str, phenomenon: int,
                      count_tokens: Callable[[str], int],
                      start_position: int = 0, file_name: str = "",
-                     official_doc_id: str = "", **kwargs) -> list[Chunk]:
+                     official_doc_id: str = "", doc_title: str = "",
+                     **kwargs) -> list[Chunk]:
     """
     Chunk the TextUnits produced by rich_layout, keeping each unit's heading
     path attached. Units are never merged across headings: two paragraphs
@@ -466,6 +490,7 @@ def chunk_text_units(units, doc_id: str, source: str, phenomenon: int,
         text: str
         file_name: str = ""
         official_doc_id: str = ""
+        title: str = ""
 
     chunks: list[Chunk] = []
     position = start_position
@@ -481,12 +506,13 @@ def chunk_text_units(units, doc_id: str, source: str, phenomenon: int,
                 source=source, file_format="pdf", phenomenon=phenomenon,
                 position=position, num_tokens=count_tokens(text), text=text,
                 context=unit.context_prefix(), page=unit.page, kind=unit.kind,
-                file_name=file_name, official_doc_id=official_doc_id))
+                file_name=file_name, official_doc_id=official_doc_id,
+                titulo=doc_title))
             position += 1
             continue
 
         pseudo = _Doc(doc_id, source, "pdf", phenomenon, unit.text,
-                      file_name, official_doc_id)
+                      file_name, official_doc_id, doc_title)
         for chunk in chunk_document(pseudo, count_tokens, **kwargs):
             chunk.chunk_id = f"{doc_id}-chunk-{position:04d}"
             chunk.position = position
@@ -495,6 +521,7 @@ def chunk_text_units(units, doc_id: str, source: str, phenomenon: int,
             chunk.kind = "body"
             chunk.file_name = file_name
             chunk.official_doc_id = official_doc_id
+            chunk.titulo = doc_title
             chunks.append(chunk)
             position += 1
 

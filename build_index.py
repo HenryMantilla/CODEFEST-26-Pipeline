@@ -488,6 +488,7 @@ def process_one(task) -> tuple:
         if kind == "rich":
             from chunking import chunk_text_units
             from rich_layout import parse_document, is_useful
+            from extraction import guess_title
 
             units = [u for u in parse_document(path, first_page=first_page,
                                                last_page=last_page)
@@ -495,11 +496,18 @@ def process_one(task) -> tuple:
             if not units:
                 return (kind, doc_id, first_page, [], "no usable units",
                         time.time() - started)
+            # FIX: filename-derived title. rich_layout units already carry
+            # their own heading trail (unit.context_prefix()), so this only
+            # adds the document-level anchor a heading trail cannot give --
+            # cheap and safe even though it is coarser than the JSON path's
+            # real title.
+            doc_title = guess_title(units[0].text if units else "", path.name)
             chunks = chunk_text_units(
                 units, doc_id=doc_id, source=str(path.relative_to(root)),
                 phenomenon=phenomenon, count_tokens=estimate_tokens,
                 file_name=path.name, official_doc_id=doc_id,
-                max_chars=max_chars, overlap_chars=overlap_chars)
+                max_chars=max_chars, overlap_chars=overlap_chars,
+                doc_title=doc_title)
             records = [c.to_dict() for c in chunks]
             _write_cache(cache_dir, path, root, records, suffix)
             return kind, doc_id, first_page, records, "", time.time() - started
@@ -548,6 +556,7 @@ def chunk_merged(args) -> tuple[str, list[dict], str, float]:
      cache_dir, path_str, root_str) = args
     from dataclasses import dataclass as _dc
     from chunking import chunk_document
+    from extraction import guess_title
 
     @_dc
     class _Doc:
@@ -558,10 +567,12 @@ def chunk_merged(args) -> tuple[str, list[dict], str, float]:
         text: str
         file_name: str = ""
         official_doc_id: str = ""
+        title: str = ""
 
     try:
         doc = _Doc(doc_id, source, "pdf", phenomenon, text,
-                   Path(path_str).name, doc_id)
+                   Path(path_str).name, doc_id,
+                   guess_title(text, Path(path_str).name))
         chunks = chunk_document(doc, estimate_tokens, max_chars=max_chars,
                                 overlap_chars=overlap_chars)
         records = [c.to_dict() for c in chunks]
@@ -1064,7 +1075,7 @@ def ocr_one_file(path: Path, root: Path, doc_id: str, phenomenon: int,
     """Phase B: OCR every page of one scanned file, then chunk it."""
     import fitz
     from chunking import chunk_document
-    from extraction import Document, clean, FORMAT_BY_SUFFIX
+    from extraction import Document, clean, FORMAT_BY_SUFFIX, guess_title
 
     cached = _read_cache(cache_dir, path, root)
     if cached is not None:
@@ -1100,7 +1111,8 @@ def ocr_one_file(path: Path, root: Path, doc_id: str, phenomenon: int,
                    file_format=file_format, text=text, phenomenon=phenomenon,
                    file_name=path.name, official_doc_id=doc_id,
                    extra={"extractor": type(engine).__name__,
-                          "ocr_lang": engine.lang})
+                          "ocr_lang": engine.lang},
+                   title=guess_title(text, path.name))
 
     chunks = chunk_document(doc, estimate_tokens, max_chars=max_chars,
                             overlap_chars=overlap_chars)
@@ -1568,6 +1580,14 @@ def build(corpus: Path, out: Path,encoder_names: list[str] | str, batch_size: in
                           "tesseract": TesseractOcrEngine}
         backend_failed = ""
         started = time.time()
+        # FIX: was read at "consecutive_failures += 1" below without ever
+        # being initialised in THIS loop -- only Phase C's loop further down
+        # sets it to 0. Phase B ran fine as long as every file's `note` was
+        # falsy or "cached" (nothing ever hit the += 1 line); the first real
+        # OCR failure or non-cached note then hit an UnboundLocalError
+        # instead of being recorded and counted. Each phase counts its own
+        # consecutive failures, so each needs its own counter.
+        consecutive_failures = 0
 
         for n, (path, doc_id, phenomenon, tess_lang, pages) in enumerate(ocr_tasks, 1):
             task_started = time.time()
@@ -1617,11 +1637,11 @@ def build(corpus: Path, out: Path,encoder_names: list[str] | str, batch_size: in
                 # looks like a corpus problem.
                 if consecutive_failures >= 20:
                     raise SystemExit(
-                        f"[4/6] 20 consecutive Docling failures, last was:\n"
+                        f"[3/6] 20 consecutive OCR failures, last was:\n"
                         f"      {note}\n"
                         f"      Aborting: this is an environment fault, not a "
-                        f"file fault. Re-run with --docling off to build "
-                        f"without Phase C, or fix the install -- the cache "
+                        f"file fault. Re-run with --ocr-backend none to build "
+                        f"without Phase B, or fix the install -- the cache "
                         f"keeps everything already extracted.")
             else:
                 consecutive_failures = 0

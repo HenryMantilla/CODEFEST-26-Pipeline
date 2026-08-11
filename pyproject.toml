@@ -10,10 +10,9 @@ dependencies = [
     "torch==2.13.0",              # PINNED: see rule 1 above
     "sentence-transformers>=5.6.1",
     "faiss-cpu>=1.15.0",          # IndexFlatIP + write_index only; the build
-                                  # makes no GPU FAISS calls, and the jury
-                                  # installs faiss-cpu per entrega/README.md
+    # makes no GPU FAISS calls, and the jury
+    # installs faiss-cpu per entrega/README.md
     "numpy>=2.4.6",
-
     # --- extraction
     "pymupdf>=1.28.0",            # PDF text, geometry, rasterising for OCR
     "pysbd>=0.3.4",               # sentence segmentation (chunking.py)
@@ -23,7 +22,6 @@ dependencies = [
     "pandas>=3.0.5",              # CSV / XLSX
     "openpyxl>=3.1.5",            # XLSX, inventory, ground truth, pool.xlsx
     "pillow>=12.3.0",             # image handling for the OCR path
-
     # --- OCR. rapidocr is the DEFAULT backend and was missing from this
     #     file entirely: it survived only because it had been pip-installed
     #     by hand, and any `uv sync` would have removed it mid-project.
