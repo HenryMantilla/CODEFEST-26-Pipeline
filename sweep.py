@@ -1,75 +1,3 @@
-"""
-sweep.py — Run many generador configurations against one loaded index.
-
-WHY THIS EXISTS
-    Every `eval.py` run reloads two encoders and rebuilds BM25 over 140k
-    chunks: minutes of setup for seconds of scoring. Fifteen configurations
-    that way is an hour of waiting, which is why knobs go untested. Here the
-    index, the encoders and the lexical channel are loaded ONCE and every
-    configuration reuses them.
-
-WHAT TO READ
-    F1@3 and nDCG@10 are the official metrics but move in steps of 1/N, and
-    with the 7-query sample N is seven. MRR over the full rankings is
-    continuous and responds to a document moving 40 -> 5, which the official
-    metrics cannot see. Sort by MRR while tuning; report F1@3 and nDCG@10.
-
-    With --judgments (tools/build_pool.py) N becomes 50 and the official
-    metrics become usable on their own.
-
-FIX: DOCUMENT AGGREGATION NOW GOES THROUGH THE SAME DISPATCH AS eval.py
-    Every row here used to call aggregate_documents() (the old cosine/
-    CombSUM aggregator) directly, unconditionally. RetrievalConfig now
-    defaults doc_score to "rankdecay" (see generador.py), under which
-    retrieve() returns doc_ranking as raw RRF-space scores. Feeding those
-    into aggregate_documents()'s max/sum/mean pooling -- calibrated for a
-    cosine spread of ~0.11 or a CombSUM spread of ~3.0 -- silently produced
-    document rankings with no relationship to what any real run (main() or
-    eval.py) would actually return, for every row that did not explicitly
-    set doc_score="combsum". That is almost certainly why past sweeps here
-    looked flat or contradicted eval.py's own numbers on the same
-    configuration. Fixed by importing eval.py's _aggregate() -- the same
-    function eval.py's evaluate() now uses -- instead of re-implementing a
-    THIRD copy of the dispatch logic that could drift out of sync with the
-    other two. See eval.py's _aggregate() docstring for the full story.
-
-FIX: GRID LABELS AND CONTENTS UPDATED FOR THE NEW DEFAULTS
-    "(default)" labels that said 1.0 for bm25_weight/graph_weight, or
-    implied doc_score="cosine", described the PRE-FIX configuration and
-    were actively misleading once the defaults changed underneath them.
-    Old-mode rows are kept, explicitly marked ABLATION, so the new default
-    can still be compared against pre-fix behaviour on your own data --
-    but they no longer masquerade as the current baseline.
-
-NEW: A COMBINED PASS
-    Single-axis grids answer "does this ONE knob help", not "what should I
-    actually ship" -- and interaction effects (does mmr_lambda=.7 still
-    help once the reranker is on?) are invisible to them by construction.
-    When more than one grid runs in a session, sweep.py now takes the
-    best-by-MRR row from EACH grid (skipping ABLATION rows -- those exist
-    for comparison, not to be shipped), merges their overrides into one
-    config, and scores that combination too. If two grids' winners touch
-    the same field, the merge is printed explicitly rather than silently
-    picking one -- that collision is information, not noise.
-
-NEW: FAULT ISOLATION, TIMING, EXPORT
-    One configuration erroring out (a bad combination, an OOM on a large
-    --rerank-depth) used to take the whole sweep down with it, discarding
-    every row already computed. Each row is now scored inside its own
-    try/except; a failure is reported and the sweep continues. Per-row
-    wall time is printed, since "does this help" and "is this affordable"
-    are different questions and this tool only answers the first one
-    honestly unless the second is visible too. --out writes every number
-    (including failures and timings) to JSON so a session survives past
-    the terminal scrollback.
-
-Usage:
-    python tools/sweep.py --gt "FASE ORDENADA CODEFEST.xlsx"
-    python tools/sweep.py --judgments pool.xlsx --grid doc
-    python tools/sweep.py --gt ... --grid doc phenomenon rerank --out sweep.json
-    python tools/sweep.py --gt ... --grid doc --no-combine   # single axis only
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -82,13 +10,10 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
 sys.path.insert(0, str(_HERE.parent / "entrega"))
 
-import eval as evaluar                                            # noqa: E402
-from entrega.generador import (GraphIndex, LexicalIndex,           # noqa: E402
+import eval as evaluar                                            
+from entrega.generador import (GraphIndex, LexicalIndex,          
                                RetrievalConfig, load_stores, retrieve)
 
-# Grids, grouped so a run answers one question rather than mixing several.
-# Rows labelled ABLATION reproduce pre-fix / non-default behaviour for
-# comparison; they are never candidates for the combined pass below.
 GRIDS: dict[str, list[tuple[str, dict]]] = {
     "graph": [
         ("off",                       {"graph_weight": 0.0}),
@@ -98,12 +23,7 @@ GRIDS: dict[str, list[tuple[str, dict]]] = {
         ("weight .5, neighbour .7",   {"graph_neighbour": 0.7}),
         ("ABLATION weight 1.0 (pre-fix default)", {"graph_weight": 1.0}),
     ],
-    # gt_doc_rank showed correct documents at deep rank 3-5 that did NOT
-    # survive the old --doc-pool 30 / mode="max" combination. rankdecay is
-    # now the default specifically to fix that -- see RetrievalConfig's
-    # doc_score docstring in generador.py. This grid's primary rows vary
-    # rankdecay's own knobs (doc_decay, doc_pool); the old cosine/CombSUM
-    # modes are kept below as an explicit, labelled comparison.
+
     "doc": [
         ("rankdecay, decay .85 (default)",       {}),
         ("rankdecay, decay .95 (flatter)",       {"doc_decay": 0.95}),
@@ -121,12 +41,7 @@ GRIDS: dict[str, list[tuple[str, dict]]] = {
         ("ABLATION combsum + rrf3, pool 400",
          {"doc_score": "combsum", "doc_agg": "rrf", "doc_pool": 400}),
     ],
-    # q002's ground truth includes an F3 document answering an F1 query, so
-    # the phenomenon prior is provably wrong at least once. "add" (default)
-    # is span-scaled and ported correctly between score spaces; "multiply"
-    # is kept as an explicit ablation of the pre-fix behaviour, which
-    # measured out to an 18% off-phenomenon leakage rate on the pooled
-    # candidates before this fix.
+
     "phenomenon": [
         ("baseline (add .20, default)", {}),
         ("frag 0",                      {"phenomenon_boost": 0.0}),
@@ -150,9 +65,7 @@ GRIDS: dict[str, list[tuple[str, dict]]] = {
         ("depth 400",      {"rerank_depth": 400}),
         ("no context",     {"rerank_context": False}),
     ],
-    # Neither of these is in any FAQ question, which is the point: the whole
-    # field is converging on dense + BM25 + cross-encoder, so those are table
-    # stakes. Coverage and expansion are where a lead comes from.
+
     "expansion": [
         ("baseline",        {}),
         ("rm3 5 terms",     {"rm3_terms": 5}),
@@ -169,13 +82,7 @@ GRIDS: dict[str, list[tuple[str, dict]]] = {
         ("mmr .5",               {"mmr_lambda": 0.5}),
         ("mmr .8 + dedupe off",  {"mmr_lambda": 0.8, "dedupe_threshold": 0.0}),
     ],
-    # bm25_weight/graph_weight default to 0.5, down from 1.0, specifically
-    # because equal-weight fusion measurably favoured Spanish-language
-    # chunks over English ones (BM25 only ever votes on same-language token
-    # overlap; the dense channels vote cross-lingually) -- see the pooled
-    # candidate analysis: 79% Spanish retrieved from a 74%-English corpus.
-    # The pre-fix value is kept below so that claim is checkable against
-    # your own data, not just asserted.
+
     "fragment": [
         ("baseline (bm25 .5, dedupe .45)", {}),
         ("dedupe .30",     {"dedupe_threshold": 0.30}),
@@ -185,6 +92,24 @@ GRIDS: dict[str, list[tuple[str, dict]]] = {
         ("bm25 2",         {"bm25_weight": 2.0}),
         ("depth 3000",     {"depth": 3000}),
         ("ABLATION bm25 1.0 (pre-fix default)", {"bm25_weight": 1.0}),
+    ],
+
+    "final_check": [
+        ("baseline (graph .5, depth 150 -- current code defaults)", {}),
+        ("graph 1.0 alone",                  {"graph_weight": 1.0}),
+        ("depth 400 alone",                  {"rerank_depth": 400}),
+        ("graph 1.0 + depth 400 (main candidate)",
+         {"graph_weight": 1.0, "rerank_depth": 400}),
+        ("graph .75 alone (midpoint)",       {"graph_weight": 0.75}),
+        ("depth 300 alone (midpoint)",       {"rerank_depth": 300}),
+        ("graph 1.0 + depth 300",
+         {"graph_weight": 1.0, "rerank_depth": 300}),
+        ("graph .75 + depth 400",
+         {"graph_weight": 0.75, "rerank_depth": 400}),
+        ("main candidate + doc_decay .70",
+         {"graph_weight": 1.0, "rerank_depth": 400, "doc_decay": 0.70}),
+        ("main candidate + bm25 1.0 (re-test joint decision)",
+         {"graph_weight": 1.0, "rerank_depth": 400, "bm25_weight": 1.0}),
     ],
 }
 
@@ -294,11 +219,7 @@ def print_row(label: str, row: dict) -> None:
           f"{row['mrr_doc']:8.3f} {row['mrr_frag']:8.3f}  "
           f"{row['seconds']:6.1f}s")
 
-
-# --------------------------------------------------------------------------- #
-# combined pass
-# --------------------------------------------------------------------------- #
-
+    
 def combine_and_score(gt, stores, lexical, graph, frag_threshold: float,
                       doc_k: int, frag_k: int,
                       winners: dict[str, tuple[str, dict, dict]]) -> None:
@@ -368,9 +289,6 @@ def combine_and_score(gt, stores, lexical, graph, frag_threshold: float,
            "collisions": collisions, "result": row, "baseline": baseline}
 
 
-# --------------------------------------------------------------------------- #
-# entry point
-# --------------------------------------------------------------------------- #
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -407,16 +325,16 @@ def main() -> None:
     else:
         raise SystemExit("Pass --gt or --judgments.")
 
-    # `doc_score` here only affects load_stores()'s --doc-encoder warning
-    # (irrelevant to a sweep that varies doc_score per row), not the sweep
-    # itself.
+
     stores = load_stores(args.index_dir, args.doc_encoder, "")
     lexical = LexicalIndex.build(stores[0].metadata,
                                  [q["query"] for q in gt])
     graph = GraphIndex.load(args.index_dir / "grafo" / "grafo.graphml")
     print(f"Grafo: {'off (not built)' if graph is None else f'{len(graph.entities)} entities'}")
     print(f"{len(gt)} queries; resolution of F1@3 is 1/{len(gt)} = "
-          f"{1/len(gt):.3f}\n")
+          f"{1/len(gt):.3f}")
+
+    print(f"query_ids used: {sorted(q.get('query_id', '?') for q in gt)}\n")
 
     grid_names = list(GRIDS) if "all" in args.grid else args.grid
     export: dict = {"grids": {}, "combined": None}

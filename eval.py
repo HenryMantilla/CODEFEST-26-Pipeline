@@ -1,53 +1,3 @@
-"""
-evaluar.py — Offline retrieval evaluation against the organisers' sample
-ground truth (CODEFEST AD ASTRA 2026). NOT part of entrega/.
-
-The ground truth lives in `FASE ORDENADA CODEFEST.xlsx`: two sheets (F1, F3),
-columns [id, PREGUNTA, FRAGMENTO, DOCUMENTO]. A question occupies one row and
-its extra relevant fragments occupy the rows below it with the first two
-columns blank, so question text is forward-filled down the sheet.
-
-WHY MATCHING IS DONE BY TEXT, NOT BY chunk_id
-    Some GT rows carry a chunk_id like DOC-0292-chunk-0144. Those come from
-    one particular build and cannot be relied on: those numbers depend on
-    rglob ordering and on max_chars/overlap_chars, so changing either makes
-    every annotated id point at different text -- a metric collapse that
-    looks like a retrieval regression and is not one.
-
-    Since the FAQ, chunk_id is the FAISS index (0, 1, 2, ...), which is even
-    more build-specific. That is the right choice for the SUBMISSION -- the
-    organisers asked for it, and 10.2.1 judges fragments on `text` anyway --
-    but it makes text matching the only sound basis for scoring against a
-    ground truth annotated on someone else's build. Hence this function.
-
-    Pooled judgments from tools/build_pool.py are the exception: they are
-    produced by the index being scored, so there chunk_id matching is exact
-    and correct.
-
-WHY A GT FRAGMENT CAN MATCH TWO CHUNKS
-    GT fragments are ~1050 chars and the index chunks at ~1000 with ~350 of
-    overlap, so a GT fragment routinely straddles a chunk boundary. Credit
-    goes to any chunk covering at least --frag-threshold of the fragment's
-    n-grams, and each GT fragment is credited at most ONCE.
-
-READ THE CEILING BEFORE READING THE SCORE
-    F1@3 cannot reach 1.0 when a query has fewer than 3 relevant documents.
-    With |D*| = 1 the best possible is P=1/3, R=1, F1=0.5. The summary prints
-    the per-query ceiling next to your score, because "0.500 on q003" is a
-    perfect result and "0.500 on q002" is a third of one, and a mean that
-    mixes them tells you nothing on its own.
-
-Usage:
-    python evaluar.py --gt "FASE ORDENADA CODEFEST.xlsx" \
-        --index-dir entrega/base_vectorial
-
-    # look at what the pipeline actually returned, with the text
-    python evaluar.py --gt ... --show-fragments 10
-
-    # is the GT text even in the index?
-    python evaluar.py --gt ... --audit
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -59,11 +9,9 @@ import sys
 import unicodedata
 from pathlib import Path
 
-
 from entrega.generador import (GraphIndex, LexicalIndex, RetrievalConfig,   # noqa: E402
                        VectorStore, add_retrieval_args, aggregate_documents,
-                       aggregate_documents_rankdecay, config_from_args,
-                       load_stores, read_jsonl, retrieve)
+                       config_from_args, load_stores, read_jsonl, retrieve)
 
 NGRAM = 8                 # word n-gram size for fragment matching
 ID_NGRAM = 5              # smaller n for matching GT questions to official ids
@@ -156,15 +104,7 @@ def load_ground_truth(path: Path) -> list[dict]:
 
 
 def load_judgments(path: Path) -> list[dict]:
-    """
-    Read pooled relevance judgments produced by tools/build_pool.py.
 
-    Returns the same shape load_ground_truth() does, so evaluate() needs no
-    special case -- except that relevance is GRADED (0/1/2) and keyed by
-    chunk_id, which is exact. The xlsx sample GT matches on text overlap
-    because its chunk_ids came from a different build; these were produced by
-    the index being scored, so no fuzzy matching is needed or wanted.
-    """
     import openpyxl
 
     sheet = openpyxl.load_workbook(path, data_only=True).active
@@ -220,15 +160,7 @@ def load_judgments(path: Path) -> list[dict]:
 
 
 def resolve_ids(gt: list[dict], queries_path: Path) -> None:
-    """
-    Attach the official q001..q050 id to each GT question by text match.
 
-    The sheet numbers its questions 2/3/4 and q0047..q0052, which are NOT the
-    official ids: they come from an earlier revision of the query set. Seven
-    match the official text (q002-q004, q033-q036). Two do not exist in the
-    final 50 at all -- both about water security in Central America -- and
-    scoring against those inflates the average with questions never asked.
-    """
     official = read_jsonl(queries_path)
 
     for entry in gt:
@@ -242,11 +174,7 @@ def resolve_ids(gt: list[dict], queries_path: Path) -> None:
 # ------------------------------------------------- metrics
 
 def f1_at_k(hits: list[bool], n_relevant: int, k: int) -> float:
-    """
-    Spec 10.2.2: a SET metric, order-insensitive. Recall's denominator is
-    min(|D*|, k) so a query with fewer than k relevant documents is not
-    penalised for slots it cannot possibly fill.
-    """
+
     found = sum(hits[:k])
     precision = found / k
     recall = found / min(n_relevant, k) if n_relevant else 0.0
@@ -278,42 +206,10 @@ def reciprocal_rank(hits: list[bool]) -> float:
 
 # ------------------------------------------------- evaluation
 
-def _aggregate(doc_ranking, n, pool, cfg: RetrievalConfig):
-    """
-    FIX: mirrors generador.py main()'s dispatch on cfg.doc_score exactly.
-
-    Before this fix, evaluate() called aggregate_documents() (the old
-    cosine/CombSUM aggregator) unconditionally, regardless of cfg.doc_score.
-    That was harmless when doc_score defaulted to "cosine", but the default
-    is now "rankdecay" (see generador.py's RetrievalConfig docstring), under
-    which retrieve() returns doc_ranking as raw RRF-space scores rather than
-    cosine/CombSUM ones. Feeding RRF-space scores (~0.003-0.017) into
-    aggregate_documents()'s max-pooling and hit_bonus -- both calibrated
-    against a cosine spread of ~0.11 or a CombSUM spread of ~3.0 -- silently
-    produces a document ranking that has no relationship to the one
-    resultados.jsonl actually ships, which is exactly the "measuring a
-    different system than you ship" failure this module's own docstring
-    warns about. Every call site that aggregates result.doc_ranking must go
-    through this function, not aggregate_documents() directly.
-    """
-    if cfg.doc_score == "rankdecay":
-        return aggregate_documents_rankdecay(doc_ranking, n, pool, cfg.doc_decay)
-    return aggregate_documents(doc_ranking, n, pool, cfg.doc_hit_bonus,
-                               cfg.doc_hit_cap, cfg.doc_agg, cfg.doc_top_m)
-
-
 def evaluate(gt, stores, cfg: RetrievalConfig, lexical, graph, frag_threshold: float,
              doc_k: int, frag_k: int, show_misses: bool,
              show_fragments: int, show_docs: bool) -> None:
-    """
-    Score the SHIPPED pipeline, not a simplified stand-in.
 
-    Ranking goes through generador.retrieve() and the CLI is built from
-    generador.add_retrieval_args(), so there is exactly one place where a
-    default can be changed and it changes both sides at once. Document
-    aggregation goes through _aggregate(), for the same reason -- see its
-    docstring.
-    """
     rows = []
 
     for entry in gt:
@@ -322,7 +218,8 @@ def evaluate(gt, stores, cfg: RetrievalConfig, lexical, graph, frag_threshold: f
 
         # ---- document level: aggregate over the same list main() uses
         wanted = [norm_doc(d) for d in entry["documents"] if d]
-        ranked_docs = _aggregate(result.doc_ranking, doc_k, cfg.doc_pool, cfg)
+        ranked_docs = aggregate_documents(result.doc_ranking, doc_k, cfg.doc_pool,
+                                          cfg.doc_hit_bonus, cfg.doc_hit_cap)
         by_doc_id = {m["doc_id"]: m for m, _ in result.doc_ranking}
 
         def matches(doc_id: str) -> bool:
@@ -334,23 +231,13 @@ def evaluate(gt, stores, cfg: RetrievalConfig, lexical, graph, frag_threshold: f
                        for w in wanted if w)
 
         doc_hits = [matches(d) for d in ranked_docs]
-
-        # WHERE the GT documents landed in the FULL ranking, not just whether
-        # they cleared rank 3. This is the number that moves when you change a
-        # flag; F1@3 only moves when a document crosses the top-3 cliff, which
-        # on seven queries makes most real improvements invisible.
-        # DEEP pool on purpose. Aggregating at cfg.doc_pool would truncate the
-        # ranking to the ~15 documents represented in the top 30 chunks, and a
-        # GT document just outside that would report as [] -- indistinguishable
-        # from "never retrieved". The shipped top-3 still uses cfg.doc_pool;
-        # this is only the ruler.
-        full_docs = _aggregate(result.doc_ranking, None,
-                               len(result.doc_ranking), cfg)
+        full_docs = aggregate_documents(result.doc_ranking, None,
+                                        len(result.doc_ranking),
+                                        cfg.doc_hit_bonus, cfg.doc_hit_cap)
         doc_ranks = [i for i, d in enumerate(full_docs, 1) if matches(d)]
 
-        # Rank under the SHIPPED pool too, so the gap between "the ranker
-        # knows" and "the aggregation kept it" is visible.
-        pooled = _aggregate(result.doc_ranking, None, cfg.doc_pool, cfg)
+        pooled = aggregate_documents(result.doc_ranking, None, cfg.doc_pool,
+                                     cfg.doc_hit_bonus, cfg.doc_hit_cap)
         pooled_ranks = [i for i, d in enumerate(pooled, 1) if matches(d)]
 
         # ---- fragment level
@@ -381,18 +268,13 @@ def evaluate(gt, stores, cfg: RetrievalConfig, lexical, graph, frag_threshold: f
         frag_hits, covered = [], set()
         for meta, _score in result.unique[:frag_k]:
             chunk_grams = ngrams(meta["texto"])
-            # Credit each GT fragment ONCE. A fragment spanning a chunk
-            # boundary matches two chunks, and counting both pushes DCG above
-            # IDCG -- which is how nDCG > 1 happens.
+
             fresh = {i for i, grams in enumerate(gt_grams)
                      if i not in covered
                      and coverage(grams, chunk_grams) >= frag_threshold}
             frag_hits.append(bool(fresh))
             covered |= fresh
 
-        # Deepest position in the WHOLE candidate pool at which each GT
-        # fragment is covered. "not in the top 10" and "at position 800" call
-        # for completely different work, and F1/nDCG cannot tell them apart.
         frag_ranks = []
         for grams in gt_grams:
             hit = next((r for r, (m, _s) in enumerate(result.candidates, 1)
@@ -442,9 +324,7 @@ def evaluate(gt, stores, cfg: RetrievalConfig, lexical, graph, frag_threshold: f
             for i, fragment in enumerate(entry["fragments"]):
                 if i in covered:
                     continue
-                # key= is required: on a tie in coverage (very common when
-                # every chunk scores 0.00) max() falls through to comparing
-                # metadata dicts, which are not orderable.
+
                 best = max(((coverage(gt_grams[i], ngrams(m["texto"])), m)
                             for m, _ in result.unique[:frag_k]),
                            key=lambda pair: pair[0], default=(0.0, None))
@@ -457,28 +337,7 @@ def evaluate(gt, stores, cfg: RetrievalConfig, lexical, graph, frag_threshold: f
 
 def inspect_fragments(result, entry, gt_grams, frag_threshold: float,
                       show: int) -> None:
-    """
-    Print the top fragments with their text so they can be judged by eye.
 
-    This is the diagnostic that every score-only report is missing. A zero
-    nDCG has three completely different causes and they need opposite fixes:
-
-      PLAUSIBLE    the winners are on-topic prose from sensible documents and
-                   the GT chunk is a hair behind. That is the encoder's
-                   resolution limit; only a stronger ranking signal (lexical
-                   channel, cross-encoder) moves it.
-      REDUNDANT    several slots hold near-identical text from one document.
-                   Retrieval is fine, the slots are wasted --
-                   lower --dedupe-threshold. Cheap, no rebuild.
-      BOILERPLATE  the winners are tables of contents, running heads,
-                   reference lists, acknowledgements: text that is close to
-                   everything and specific to nothing. That is an
-                   extraction/indexing problem and no ranking change fixes it.
-
-    The `channels` column shows each fragment's rank in each retrieval
-    channel, so you can see whether BM25 and the dense encoders agree or
-    whether one of them is carrying the result alone.
-    """
     ranks_by_channel = []
     for name, ranking in result.channels:
         ranks_by_channel.append(
@@ -533,9 +392,6 @@ def summarise(rows: list[dict], doc_k: int, frag_k: int) -> None:
           f"{sum(r['f1'] for r in rows)/n:7.3f} "
           f"{sum(r['ndcg'] for r in rows)/n:8.3f}")
 
-    # Continuous companions to the two cliff metrics. Mean reciprocal rank
-    # over the FULL rankings responds to a document moving 40 -> 5, which
-    # F1@3 cannot see. Tune against these; report the official ones.
     def mrr(key):
         total = 0.0
         for row in rows:
@@ -643,7 +499,6 @@ def check_doc_ids(store: VectorStore) -> None:
               f"against Indice_Datos_Codefest.xlsx.")
 
 
-# ------------------------------------------------- entry point
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -700,6 +555,7 @@ def main() -> None:
 
     print(f"Ground truth: {len(gt)} queries, "
           f"{sum(len(q['fragments']) for q in gt)} fragments")
+    print(f"query_ids used: {sorted(q.get('query_id', '?') for q in gt)}")
 
     if args.dump_gt:
         with args.dump_gt.open("w", encoding="utf-8") as fh:
@@ -710,13 +566,10 @@ def main() -> None:
     stores = load_stores(args.index_dir, args.doc_encoder, cfg.doc_score)
     print(f"evaluar  : build 2026-08-08d (reports gt_doc_rank / gt_frag_rank)")
     print(f"Encoders : {[s.name for s in stores]}")
-    print(f"Documents: {cfg.doc_score}"
-          + (f", decay={cfg.doc_decay}" if cfg.doc_score == "rankdecay"
-             else f", pool={cfg.doc_pool}, hit +{cfg.doc_hit_bonus:.0%} "
-                  f"x{cfg.doc_hit_cap}"))
+    print(f"Documents: {cfg.doc_score}, pool={cfg.doc_pool}, "
+          f"hit +{cfg.doc_hit_bonus:.0%} x{cfg.doc_hit_cap}")
     print(f"Fragments: dedupe>={cfg.dedupe_threshold}, "
-          f"phenomenon {cfg.phenomenon_mode} {cfg.phenomenon_boost}, "
-          f"bm25 w={cfg.bm25_weight}"
+          f"phenomenon x{1 + cfg.phenomenon_boost:.2f}, bm25 w={cfg.bm25_weight}"
           + (f", reranker={cfg.reranker}" if cfg.reranker else ""))
     check_doc_ids(stores[0])
 

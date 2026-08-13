@@ -1,78 +1,3 @@
-"""
-generador.py — Retrieval module (CODEFEST AD ASTRA 2026, sections 8-9).
-
-The file name is mandated by section 1.4. The code inside is English.
-
-SELF-CONTAINED BY DESIGN
-    This file imports NOTHING from the rest of the repository. Everything it
-    needs -- sentence segmentation, the 250-word splitter, fusion, filters --
-    is defined here. The only inputs are entrega/base_vectorial/ and the
-    query file, both of which ship inside entrega/. Section 1.4 says a
-    submission that cannot be reproduced is excluded from evaluation, so the
-    script must run from an unpacked entrega/ directory with nothing else
-    present.
-
-    Third-party requirements only:
-        pip install faiss-cpu sentence-transformers numpy
-
-Usage:
-    python generador.py --index-dir base_vectorial \
-        --queries consultas_50.jsonl --out resultados.jsonl
-
-    # ablations (each flag isolates one component)
-    python generador.py ... --bm25-weight 0
-    python generador.py ... --dedupe-threshold 0
-    python generador.py ... --phenomenon-boost 0
-    python generador.py ... --doc-score cosine
-
-------------------------------------------------------------------------
-THE FOUR RANKING CHANNELS
-------------------------------------------------------------------------
-    dense_1..dense_n  one FAISS index per encoder (8.1, 8.2, 4.4)
-    lexical           BM25 over metadata.jsonl, built at run time
-
-    A dense-only pipeline is the wrong shape for this corpus. 74% of the
-    documents are English, 100% of the queries are Spanish, and a large part
-    of the answer set is named entities -- municipalities, armed groups
-    ("ELN", "EMC", "Clan del Golfo"), agency acronyms, treaty names. Those
-    are exactly the tokens a dense encoder blurs and exactly the ones BM25
-    nails. BM25 is pure term statistics over metadata: no model, no decoder,
-    permitted without argument under 8.3.
-
-    The lexical index is built from metadata.jsonl at start-up, restricted to
-    the vocabulary of the query set, so it costs one pass over the metadata
-    and a few hundred megabytes. Nothing extra ships in entrega/.
-
-------------------------------------------------------------------------
-FRAGMENTS AND DOCUMENTS USE DIFFERENT SCORE SPACES
-------------------------------------------------------------------------
-    Fragments rank on RRF. RRF is rank-based, so it fuses channels whose
-    scores are not comparable (cosine ~0.85, BM25 ~14) without any
-    calibration. That is what 8.4 describes and it is the right tool for
-    picking a top-10.
-
-    Documents do NOT rank on RRF. RRF maps rank r to 1/(60+r): rank 1 scores
-    0.0164 and rank 100 scores 0.0063. A document first seen at rank 100
-    cannot catch the leader even with the full repetition bonus, so document
-    order gets frozen by the first handful of candidates. The measured
-    symptom was a doc-pool sweep from 10 to 300 returning byte-identical
-    F1@3 at every value.
-
-    Documents therefore rank on min-max normalised CombSUM (8.4, equation 5),
-    which preserves the spread between a strong and a weak match. 8.6 also
-    says aggregation operates on "las puntuaciones numéricas producidas por
-    FAISS" -- scores, not fused ranks. `--doc-score cosine` restores the
-    single-encoder behaviour for ablation.
-
-------------------------------------------------------------------------
-MULTI-ENCODER FUSION REQUIRES ONE SHARED CHUNK SET
-------------------------------------------------------------------------
-    Fusion keys on chunk_id, so every index MUST come from the same build.
-    Two separate build runs can silently disagree (a file that failed OCR the
-    first time and succeeded the second) and then chunk_id N means different
-    text in each index. load_stores() warns when the counts differ.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -86,28 +11,10 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# faiss / sentence_transformers are imported lazily inside VectorStore so that
-# --help and the schema validator run without a torch install.
 
-
-# =====================================================================
-# defaults -- ONE source of truth, shared with evaluar.py
-# =====================================================================
-#
-# evaluar.py imports these and builds its CLI from add_retrieval_args(), so
-# the evaluated pipeline and the shipped pipeline cannot drift apart. They
-# already did once: generador.py defaulted --doc-pool to 30 while evaluar.py
-# defaulted it to 50, which means every F1@3 number printed for weeks
-# described a configuration that was never written to resultados.jsonl.
-
-RRF_K = 60                   # Reciprocal Rank Fusion smoothing constant (8.4)
-# Separate, much smaller constant for the rerank blend. RRF_K=60 is tuned for
-# fusing whole retrieval runs, where the tail matters; inside a 150-item
-# shortlist it is so flat that the cross-encoder cannot lift rank 87 into the
-# top 10 even with its top vote. k=10 makes position differences bite while
-# still requiring a strong contrary signal to unseat a unanimous rank 1.
+RRF_K = 60                  
 RERANK_RRF_K = 10
-CANDIDATE_DEPTH = 1000       # results pulled per channel before fusion
+CANDIDATE_DEPTH = 1000      
 
 
 @dataclass
@@ -119,32 +26,10 @@ class RetrievalConfig:
     dedupe_threshold: float = 0.45
     dedupe_window: int = 200
 
-    # metadata post-filter (8.7)
-    # FIX: fragments used mode="multiply" at 0.08 -- in RRF space (scores
-    # ~0.016) that is worth about five rank positions, which measured out to
-    # an 18% off-phenomenon leakage rate in the pooled candidates and near
-    # zero difference against the "no phenomenon" ablation (Jaccard 0.98
-    # between the two). Switched fragments to the same span-scaled "add"
-    # mode documents already use, so one number means the same thing in
-    # both places (see apply_phenomenon_boost's docstring on why "multiply"
-    # does not port between score spaces). phenomenon_mode is a new flag so
-    # the old multiplicative behaviour is still reachable for ablation.
     phenomenon_boost: float = 0.20       # fraction of the RRF pool's score span
     phenomenon_mode: str = "add"         # add | multiply -- add is span-scaled
     phenomenon_boost_doc: float = 0.30   # ADDITIVE, as a FRACTION of the score span
 
-    # lexical channel
-    # FIX (measured on pool.xlsx): bm25/graph and the dense encoders got
-    # equal weight (1.0 each) in RRF, but BM25 and the graph's typed
-    # relations only ever fire on same-language token overlap -- Spanish
-    # queries against a 74%-English corpus. A chunk that matches in Spanish
-    # gets a vote from every channel; a chunk that only a dense encoder can
-    # cross-lingually match gets fewer votes purely because of language, not
-    # relevance. Measured result: 79% of retrieved fragments were Spanish
-    # against a 74%-English corpus. Down-weighting to 0.5 does not remove
-    # the lexical signal (still valuable for acronyms and place names -- see
-    # the module docstring) but stops it outvoting cross-lingual dense
-    # matches by sheer channel count. Re-sweep if the encoder mix changes.
     bm25_weight: float = 0.5
     bm25_k1: float = 1.2
     bm25_b: float = 0.75
@@ -155,25 +40,6 @@ class RetrievalConfig:
     rm3_original_weight: float = 0.6
     mmr_lambda: float = 1.0     # 1.0 disables diversification
 
-    # document aggregation (8.6)
-    # FIX: default was "cosine", which means documents are ranked by
-    # stores[0]'s single best chunk -- and stores[0] is whichever encoder
-    # sorts first ALPHABETICALLY unless --doc-encoder is passed (see
-    # load_stores()'s own docstring calling this "an arbitrary basis for a
-    # scored decision"). Combined with doc_agg="max" (which the docstring
-    # below already documents as making --doc-pool a no-op), document
-    # ranking was decided by one lucky top-2 chunk from one arbitrarily-
-    # chosen encoder, ignoring BM25 and the graph channel entirely at the
-    # document level. Measured: q018/q019/q026 each had ~50% of their
-    # candidate pool concentrated in a single document.
-    #
-    # New default "rankdecay" aggregates documents from the SAME fused,
-    # phenomenon-boosted, reranked candidate list used for fragments,
-    # scoring each document by reciprocal rank of its chunks' POSITIONS in
-    # that list with a per-chunk decay (see aggregate_documents_rankdecay).
-    # This uses every channel's agreement, not one encoder's raw cosine, and
-    # removes the alphabetical-encoder dependency entirely. "combsum" and
-    # "cosine" stay available for ablation against the old behaviour.
     doc_score: str = "rankdecay"     # rankdecay | combsum | cosine
     doc_decay: float = 0.85          # per-chunk decay for rankdecay, see below
     doc_pool: int = 30
@@ -299,17 +165,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 def resolve_input(path: Path) -> Path:
-    """
-    Find an input whether the script is run from inside entrega/ or from the
-    repository root.
 
-    The defaults are written for the jury, who unpack entrega/, cd into it
-    and run `python generador.py`. Developing from the repo root means the
-    same relative path points somewhere else, and the failure mode is a
-    SystemExit about a missing index that looks like a broken build. So: try
-    the path as given, then the same path next to this script, and say which
-    one was used.
-    """
     if path.exists():
         return path
     beside = SCRIPT_DIR / path
@@ -331,15 +187,6 @@ def config_from_args(args) -> RetrievalConfig:
             setattr(cfg, name, getattr(args, name))
     return cfg
 
-
-# =====================================================================
-# sentence segmentation  (inlined from chunking.py -- see module docstring)
-# =====================================================================
-#
-# Only split_to_250_words() needs this at query time, and only for chunks
-# that exceed the 250-word output cap (9.2.1). Under the shipped chunking
-# parameters that never happens, but the rule is mandatory and a chunk set
-# built with different parameters must still produce a legal file.
 
 _ABBREV = (r"Sr|Sra|Srta|Dr|Dra|Ing|Lic|Mg|Prof|Ph\.D|EE\.UU|EEUU|etc|vs|cf|"
            r"p\.ej|aprox|núm|No|Nro|Art|Fig|Tab|Cap|Vol|ed|eds|al|Mr|Mrs|Ms|"
@@ -373,11 +220,7 @@ def _get_segmenter():
 
 
 def split_sentences(text: str) -> list[str]:
-    """
-    Multilingual sentence splitter (es/en/pt). The regex fallback masks
-    dotted acronyms, abbreviations, decimals and initials before cutting, so
-    it does not shatter "EE.UU." or "3.5 millones" into fake sentences.
-    """
+
     segmenter = _get_segmenter()
     if segmenter is not None:
         try:
@@ -404,11 +247,7 @@ def split_sentences(text: str) -> list[str]:
 
 
 def split_to_250_words(text: str, limit: int = 250) -> list[str]:
-    """
-    Split an oversized chunk into sub-fragments of <= limit words, cutting
-    only at sentence boundaries (9.2.1). All sub-fragments keep the original
-    chunk_id and each takes its own rank.
-    """
+
     if len(text.split()) <= limit:
         return [text]
 
@@ -436,9 +275,6 @@ def split_to_250_words(text: str, limit: int = 250) -> list[str]:
     return final
 
 
-# =====================================================================
-# text normalisation shared by the lexical index and the deduplicator
-# =====================================================================
 
 _PUNCT = re.compile(r"[^\w\s]", re.UNICODE)
 _WS = re.compile(r"\s+")
@@ -453,20 +289,6 @@ def strip_accents(text: str) -> str:
     decomposed = unicodedata.normalize("NFD", text)
     return "".join(c for c in decomposed if unicodedata.category(c) != "Mn")
 
-
-# U+0085 (NEL), U+2028 (LINE SEPARATOR) and U+2029 (PARAGRAPH SEPARATOR).
-#
-# These three are the reason a metadata.jsonl that json.dumps wrote can fail
-# to parse back. json.dumps(ensure_ascii=False) escapes control characters
-# below 0x20, but not these -- they go into the file raw. Python's
-# str.splitlines() then treats all three as line breaks, so any reader built
-# on read_text().splitlines() cuts a record in half and json.loads reports an
-# unterminated string. Iterating the file object, or splitting on "\n", does
-# not have this problem.
-#
-# They arrive from PDF extraction and from OCR of Latin-1 sources, and they
-# are invisible in every editor, so this looks like a corrupt index when
-# nothing is wrong with it.
 _LINE_SEPARATORS = re.compile("[\u0085\u2028\u2029]")
 
 
@@ -484,10 +306,6 @@ def read_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in
             path.read_text(encoding="utf-8").split("\n") if line.strip()]
 
-
-# Function words in the three corpus languages. Removing them keeps the
-# lexical vocabulary (and therefore the postings lists) down to the terms
-# that actually discriminate.
 _STOPWORDS = set("""
 de la que el en y a los del se las por un para con no una su al lo como mas
 pero sus le ya o este si porque esta entre cuando muy sin sobre tambien me
@@ -521,10 +339,6 @@ def shingles(text: str, n: int = 8) -> set[tuple]:
         return {tuple(words)} if words else set()
     return {tuple(words[i:i + n]) for i in range(len(words) - n + 1)}
 
-
-# =====================================================================
-# dense channel
-# =====================================================================
 
 class VectorStore:
     def __init__(self, folder: Path):
@@ -599,11 +413,6 @@ def load_stores(index_dir: Path, doc_encoder: str = "",
               "Rebuild every encoder in a single build_index run.")
     return stores
 
-
-# =====================================================================
-# lexical channel  (BM25 over metadata.jsonl)
-# =====================================================================
-
 class LexicalIndex:
     """
     BM25 restricted to the vocabulary of the query set.
@@ -669,48 +478,16 @@ class LexicalIndex:
         top = sorted(scores.items(), key=lambda kv: -kv[1])[:k]
         return [(self.metadata[i], float(s)) for i, s in top]
 
-
-
-# =====================================================================
-# knowledge graph channel  (spec sections 7 and 8.5, bonus)
-# =====================================================================
-
 class GraphIndex:
-    """
-    The knowledge graph as a retrieval channel.
 
-    "Es bono y para que sea valido lo deben integrar a la recuperacion, el
-    solo construirlo no es valido." (organisers' FAQ). Building grafo.graphml
-    scores nothing on its own; this class is what makes it count.
-
-    Section 8.5, implemented step for step:
-      1. identify the entities named in the query;
-      2. pull the chunks linked to those entities AND to their first-order
-         neighbours in the graph;
-      3. score each chunk by the number of relevant relations behind it;
-      4. fuse that ranking with the FAISS results as one more index in the
-         RRF of 8.4.
-
-    READ WITH THE STANDARD LIBRARY, ON PURPOSE. GraphML is XML, and
-    xml.etree parses it in thirty lines. networkx is needed to BUILD the
-    graph but shipping it as a query-time dependency would add a package to
-    entrega/'s install for no capability -- and 1.4 excludes a submission
-    that cannot be reproduced.
-
-    WHY IT ADDS SOMETHING THE ENCODERS DO NOT. A dense encoder places "ELN"
-    and "Catatumbo" near each other because they co-occur in training text.
-    The graph says they co-occur in THIS corpus, in a specific passage, and
-    names the passage. That is a different kind of evidence, and it is
-    strongest exactly where embeddings are weakest: rare named entities.
-    """
 
     def __init__(self, entities: dict, edges: list):
-        self.entities = entities            # normalised name -> {tipo, chunks}
+        self.entities = entities        
         self.neighbours: dict[str, list[tuple[str, int]]] = defaultdict(list)
         for a, b, weight in edges:
             self.neighbours[a].append((b, weight))
             self.neighbours[b].append((a, weight))
-        # Longest first, so "clan del golfo" is matched before "golfo".
+      
         self.by_length = sorted(entities, key=len, reverse=True)
 
     @classmethod
@@ -722,7 +499,6 @@ class GraphIndex:
         namespace = {"g": "http://graphml.graphdrawing.org/xmlns"}
         root = ET.parse(path).getroot()
 
-        # GraphML indirects attribute names through <key id=... attr.name=...>
         names = {k.get("id"): k.get("attr.name")
                  for k in root.findall("g:key", namespace)}
 
@@ -780,12 +556,9 @@ class GraphIndex:
 
         scores: dict[str, float] = defaultdict(float)
         for seed in seeds:
-            # Direct evidence: the entity is named in the chunk.
             for chunk_id in self.entities.get(seed, {}).get("chunks", ()):
                 scores[chunk_id] += 1.0
-            # First-order neighbours (8.5 step 2), discounted, and weighted by
-            # how many times the relation was actually observed -- an edge
-            # seen forty times is stronger evidence than one seen once.
+
             for other, weight in self.neighbours.get(seed, ()):
                 bonus = neighbour_weight * min(weight, 10) / 10.0
                 for chunk_id in self.entities.get(other, {}).get("chunks", ()):
@@ -795,10 +568,6 @@ class GraphIndex:
         return [(metadata_by_chunk[c], s) for c, s in ranked
                 if c in metadata_by_chunk]
 
-
-# =====================================================================
-# fusion
-# =====================================================================
 
 def fuse_rrf(rankings: list[list[tuple[dict, float]]],
              weights: list[float] | None = None) -> list[tuple[dict, float]]:
@@ -856,7 +625,7 @@ def fuse_combsum(rankings: list[list[tuple[dict, float]]],
 
 
 # =====================================================================
-# post-filters (8.7)
+# post-filters 
 # =====================================================================
 
 def expected_phenomenon(query_id: str) -> int:
@@ -946,13 +715,6 @@ def deduplicate(candidates: list[tuple[dict, float]], threshold: float,
     worth an actual sweep: {0.28, 0.35, 0.45, 0.60} against nDCG@10. Watch
     the metric, not the suppression count -- a big count only proves the
     filter is firing, not that it is helping.
-
-    Do NOT "fix" this by lowering overlap_chars in the chunker: the overlap is
-    what aligns fragment boundaries with the organisers' ~708-character step.
-
-    `window` caps the work: this is O(kept^2) in set intersections and the
-    fused pool runs to a few thousand entries. The tail is appended untouched
-    so the fragment fallback still has a full list to draw on.
     """
     if threshold <= 0:
         return candidates
@@ -980,41 +742,6 @@ def rerank(candidates: list[tuple[dict, float]], query: str, model_name: str,
            _cache: dict = {}) -> list[tuple[dict, float]]:
     """
     Optional cross-encoder rerank of the top `depth` fragments.
-
-    COMPLIANCE: ASKED AND ANSWERED. The organisers were asked this directly,
-    by three separate teams, and confirmed it in the FAQ:
-
-        "Si esta permitido re ranking con cross-encoders. La restricción
-         aplica es para arquitecturas decoders."
-        "Un cross encoder si es permitido. La restricción aplica para
-         arquitecturas tipo decoder."
-
-    BAAI/bge-reranker-v2-m3 is XLM-RoBERTa-large with a scalar relevance
-    head: encoder-only, non-autoregressive, generating nothing. This was ON
-    BY DEFAULT only after that ruling; before it, the narrow reading of 8.3
-    ("vectores, puntuaciones de similitud y metadata") made it a judgement
-    call and the safe default was off. Still name the architecture in
-    informe_tecnico.pdf -- a declared reranker reads better than one a judge
-    discovers.
-
-    Practically, this is the single largest available gain on nDCG@10: dense
-    retrieval that puts the right chunk at rank 15-40 is exactly what a
-    cross-encoder repairs.
-
-    BLEND, AND WHY IT IS NOT 1.0.
-        Replacing the order outright throws away the retrievers' agreement.
-        Measured on this corpus: reranking lifted three ground-truth
-        fragments from ranks 87, 43 and 103 into the top 10 -- and pushed a
-        fragment that two encoders and BM25 had ALL put at rank 1 down to 31,
-        turning the one query scoring nDCG@10 = 1.000 into a zero. Net effect
-        on the mean was slightly negative despite three clear wins.
-
-        A cross-encoder is better at fine discrimination inside a shortlist
-        and worse at the coarse judgement the retrievers already made
-        together. So fuse the two orderings by RRF rather than substituting:
-        blend=1.0 is the cross-encoder alone, 0.0 disables it, 0.5 gives each
-        an equal vote. Sweep {1.0, 0.7, 0.5, 0.3} -- and on seven queries,
-        prefer the value that helps several rather than the one that wins.
     """
     if not model_name or not candidates:
         return candidates
@@ -1063,30 +790,7 @@ def rerank(candidates: list[tuple[dict, float]], query: str, model_name: str,
 def expand_query_rm3(lexical: "LexicalIndex", query: str,
                      feedback_docs: int = 10, terms: int = 10,
                      original_weight: float = 0.6) -> str:
-    """
-    RM3 pseudo-relevance feedback: re-run the lexical channel with terms
-    borrowed from its own top results.
 
-    LEGAL, AND WORTH CHECKING THAT CAREFULLY. Section 8.3 forbids
-    "reformulación o expansión de la consulta mediante un DECODER". RM3 uses
-    no model at all -- it counts terms in the documents the first pass
-    returned and adds the most discriminative ones back. It is 2001-era term
-    statistics, the same family as BM25 itself, which the organisers have
-    confirmed twice is permitted.
-
-    WHY IT SHOULD HELP HERE. The queries are one-sentence Spanish
-    abstractions ("¿Cómo utilizan los grupos armados ilegales el control
-    territorial...?") and the documents are full of the specific vocabulary
-    that actually distinguishes them: municipality names, "economías
-    ilícitas", "extorsión", "corredores estratégicos". The query cannot match
-    what it does not mention. Feedback puts the corpus's own words into the
-    query.
-
-    THE RISK IS DRIFT. If the first pass is wrong, expansion amplifies the
-    error -- that is why `original_weight` keeps the user's terms dominant
-    and why the expansion is repeated, not averaged: repeating a term is how
-    a bag-of-words query expresses weight.
-    """
     top = lexical.search(query, feedback_docs)
     if not top:
         return query
@@ -1116,17 +820,6 @@ def diversify_mmr(candidates: list[tuple[dict, float]], lam: float = 0.7,
                   n: int = 10, window: int = 60) -> list[tuple[dict, float]]:
     """
     Maximal Marginal Relevance over the top candidates.
-
-    WHY THIS AND NOT JUST DEDUPE. deduplicate() is a threshold: a fragment is
-    either a repeat or it is not. MMR is continuous -- it trades relevance
-    against novelty at every step, so the second slot goes to the best
-    fragment that adds something, not merely to one that clears a similarity
-    bar. nDCG@10 rewards covering SEVERAL relevant passages, and a query with
-    three annotated fragments cannot score well if all ten slots paraphrase
-    the first.
-
-    lam=1.0 is the unmodified ranking; lower values buy coverage with
-    relevance. Applied only to the head, so the fallback list stays intact.
     """
     if lam >= 1.0 or not candidates:
         return candidates
@@ -1162,9 +855,6 @@ def diversify_mmr(candidates: list[tuple[dict, float]], lam: float = 0.7,
     return ordered + tail
 
 
-# =====================================================================
-# output assembly
-# =====================================================================
 
 def aggregate_documents(ranking: list[tuple[dict, float]], n: int | None = 3,
                         pool: int = 30, hit_bonus: float = 0.02,
@@ -1176,62 +866,22 @@ def aggregate_documents(ranking: list[tuple[dict, float]], n: int | None = 3,
 
     MUST be fed a score list with real spread -- cosine or normalised
     CombSUM, never RRF. See the module docstring.
-
-    CALIBRATE hit_bonus AGAINST THE SCORE SPREAD. Cosine similarity on this
-    corpus runs about 0.78-0.88, an 11% spread. The previous 0.05 per extra
-    chunk, capped at 5, was worth up to 25% -- more than twice the entire
-    range of the signal it multiplied. Document ranking was therefore decided
-    almost entirely by which document had the most chunks in the pool, which
-    systematically favours 1000-page reports over the short document that
-    actually answers the question. 0.02 capped at 3 (max 6%) leaves the
-    repetition bonus as a tie-breaker, which is what 8.6 describes.
-
-    `pool` bounds how many chunks are aggregated, because 8.6 aggregates the
-    k_chunk MOST relevant fragments, not the whole candidate list.
-
-    Deliberately runs on the PRE-dedupe list: at document level, several
-    overlapping windows of one passage genuinely are weaker evidence than
-    several distinct passages, and the hit bonus is what expresses that.
-
-    n=None returns the FULL ordered list instead of the top n. F1@3 is a
-    cliff: a document at rank 4 and a document at rank 400 both score zero,
-    so on a seven-query sample almost every configuration change is
-    invisible. evaluar.py uses n=None to report where the ground-truth
-    document actually landed, which moves continuously and can therefore be
-    tuned against.
     """
     per_doc: dict[str, list[float]] = defaultdict(list)
     for meta, score in ranking[:pool]:
         per_doc[meta["doc_id"]].append(score)
 
     if mode == "max":
-        # MAX POOLING MAKES --doc-pool A NO-OP, WHICH IS NOT OBVIOUS.
-        # Enlarging the pool can only admit documents whose best chunk is
-        # deeper and therefore scores lower, so they can never displace the
-        # incumbent top 3. Measured: doc_pool 30 / 60 / 150 / 400 returned
-        # byte-identical F1@3. Only the hit bonus can reorder anything, and it
-        # is capped at 6%.
-        #
-        # The consequence is that document ranking is decided by each
-        # document's SINGLE best chunk. A report that is broadly relevant --
-        # eight good chunks at ranks 40-90 -- loses to one with a single
-        # lucky chunk at rank 2. That is the wrong prior for 10.2.2, which
-        # asks which DOCUMENTS answer the question.
+
         base = {d: max(v) for d, v in per_doc.items()}
     elif mode == "sum":
-        # Sum of the document's top-m chunks. Rewards breadth: several good
-        # passages beat one great one. This is the mode that makes --doc-pool
-        # matter, because a document's chunks at ranks 40-90 now contribute.
+
         base = {d: sum(sorted(v, reverse=True)[:top_m]) for d, v in per_doc.items()}
     elif mode == "mean":
-        # Mean of the top-m, padded with zeros when fewer than m exist, so a
-        # document with one chunk is not rewarded for having no weak ones.
+
         base = {d: sum(sorted(v, reverse=True)[:top_m]) / top_m
                 for d, v in per_doc.items()}
     else:                                    # rrf
-        # Rank-based within the pool: robust when scores are poorly
-        # calibrated, and naturally diminishing so one document cannot win on
-        # volume alone.
         position = {}
         for rank, (meta, _s) in enumerate(ranking[:pool], 1):
             position.setdefault(meta["doc_id"], []).append(rank)
@@ -1246,8 +896,7 @@ def aggregate_documents(ranking: list[tuple[dict, float]], n: int | None = 3,
     if n is None:                       # full ranking, for diagnostics
         return ordered
 
-    # 9.3.2: exactly 3 documents or the line is discarded. If the pool held
-    # fewer than 3 distinct documents, widen it rather than ship a short list.
+
     if len(ordered) < n:
         for meta, _score in ranking:
             if meta["doc_id"] not in ordered:
@@ -1261,42 +910,7 @@ def aggregate_documents_rankdecay(ranking: list[tuple[dict, float]],
                                   n: int | None = 3, pool: int = 30,
                                   decay: float = 0.85,
                                   rrf_k: int = RRF_K) -> list[str]:
-    """
-    FIX (replaces the cosine/combsum default -- see RetrievalConfig.doc_score).
-
-    Aggregates documents from the FUSED FRAGMENT RANKING directly -- the
-    same phenomenon-boosted, reranked candidate list `build_fragments()`
-    draws the ten returned fragments from -- instead of a separately
-    computed cosine or CombSUM ranking. A document's score is the sum, over
-    its chunks in this list, of that chunk's reciprocal rank discounted by
-    how many of the document's OWN chunks came before it:
-
-        score(d) = sum_i  1/(rrf_k + rank_i + 1) * decay**i
-
-    where `rank_i` is the chunk's position (0-based) in `ranking` and `i` is
-    its position among the document's own chunks, sorted best-first.
-
-    WHY THIS FIXES THE OLD DEFAULT'S THREE PROBLEMS AT ONCE.
-      1. No arbitrary encoder. `ranking` is the fused, multi-channel list
-         every fragment comes from -- BM25, the graph and every dense
-         encoder already voted on it via fuse_rrf(). There is no
-         "stores[0]" or --doc-encoder to get wrong.
-      2. --doc-pool is no longer a no-op. Because the score is a SUM with
-         decay, not a max, a document that is broadly relevant (several
-         good chunks at ranks 40-90) can still outscore one with a single
-         lucky chunk at rank 2 -- the old max-pooling default could never
-         do this regardless of --doc-pool.
-      3. One score space, not two. Fragments and documents are now the same
-         underlying ranking with two different aggregations, rather than
-         two independently-tuned pipelines that can (and did) disagree
-         about which documents matter.
-
-    `decay` trades breadth against a single strong hit: 1.0 makes every
-    chunk count equally (closest to the old doc_agg="sum"); lower values
-    concentrate credit on a document's best 2-3 chunks. 0.85 is a starting
-    point, not a measured optimum -- sweep it against F1@3 like any other
-    knob here.
-    """
+    
     per_doc: dict[str, list[int]] = defaultdict(list)
     for rank, (meta, _score) in enumerate(ranking[:pool]):
         per_doc[meta["doc_id"]].append(rank)
@@ -1349,11 +963,10 @@ def build_fragments(candidates: list[tuple[dict, float]], n: int = 10) -> list[d
 
 @dataclass
 class Retrieved:
-    candidates: list[tuple[dict, float]]   # fused pool, RRF space. Fallback.
-    unique: list[tuple[dict, float]]       # the same, deduped. FRAGMENTS.
-    doc_ranking: list[tuple[dict, float]]  # cosine or CombSUM. DOCUMENTS.
-    channels: list[tuple[str, list[tuple[dict, float]]]]  # per-channel, for eval
-
+    candidates: list[tuple[dict, float]]   
+    unique: list[tuple[dict, float]]   
+    doc_ranking: list[tuple[dict, float]]  
+    channels: list[tuple[str, list[tuple[dict, float]]]] 
 
 def retrieve(stores: list[VectorStore], query: str, query_id: str = "",
              cfg: RetrievalConfig | None = None,
@@ -1415,13 +1028,6 @@ def retrieve(stores: list[VectorStore], query: str, query_id: str = "",
                             cfg.rerank_depth, cfg.rerank_blend,
                             cfg.rerank_context)
 
-    # ---- documents (8.6)
-    # FIX: "rankdecay" (default) reuses THIS SAME fused, phenomenon-boosted,
-    # reranked list -- every channel already voted on it -- instead of a
-    # second, independently-computed cosine/CombSUM ranking that depended on
-    # which encoder happened to load first. See aggregate_documents_rankdecay
-    # and RetrievalConfig.doc_score for the full reasoning. "combsum"/
-    # "cosine" recompute the old separate ranking for ablation.
     if cfg.doc_score == "rankdecay":
         doc_ranking = candidates
     elif cfg.doc_score == "cosine":
@@ -1464,9 +1070,7 @@ def read_queries(path: Path) -> list[tuple[str, str]]:
 
 def validate(path: Path) -> bool:
     """Strict schema check (9.3.2). Failing here means failing the submission."""
-    # split("\n"), not splitlines(): a fragment carrying U+2028 would
-    # otherwise be miscounted as two lines and reported as a schema failure
-    # that does not exist.
+
     raw = path.read_text(encoding="utf-8")
     lines = [l for l in raw.split("\n") if l.strip()]
     errors = []

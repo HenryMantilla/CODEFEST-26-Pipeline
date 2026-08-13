@@ -1,33 +1,3 @@
-"""
-build_graph.py — Knowledge graph over the indexed chunks (Section 7, bonus).
-
-WHAT THE SPEC ASKS FOR
-    G = (E, R, T), T subset of E x R x E. Entities from NER, relations from RE,
-    every triple keeping a reference to its doc_id and chunk_id so the textual
-    evidence stays traceable (7.2). Delivered as
-    entrega/base_vectorial/grafo/grafo.graphml (1.4).
-
-    And, decisively, from the organisers' FAQ:
-
-        "Es bono y para que sea valido lo deben integrar a la recuperacion,
-         el solo construirlo no es valido."
-
-    So this file is only half the work. The other half is GraphIndex in
-    generador.py, which makes the graph an actual retrieval channel.
-
-DECODER-FREE (4.2, 8.3)
-    NER here uses GLiNER (Zero-Shot Token Classification) -- an encoder with a 
-    per-token label head. It assigns labels to spans; it generates nothing. 
-    Relation extraction is co-occurrence plus linguistic patterns, which 7.2 
-    lists explicitly as an acceptable method.
-
-Requires: pip install networkx gliner torch
-
-Usage:
-    python tools/build_graph.py --index-dir entrega/base_vectorial \
-        --out entrega/base_vectorial/grafo/grafo.graphml --recompute-ner
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -348,15 +318,6 @@ def main() -> None:
             except Exception:
                 pass
 
-        # FIX: restore the length/total check dropped in the GLiNER
-        # rewrite. Without it, a cache built with a different --limit, a
-        # different corpus, or before a rebuild silently gets zipped
-        # against the current `texts` regardless of length -- and if it is
-        # SHORTER than the current corpus, `pending = [i for i in
-        # range(len(texts)) if per_chunk[i] is None]` below indexes past
-        # the end of a `per_chunk` that was replaced wholesale by the
-        # cached rows, raising IndexError deep into a run instead of
-        # failing fast with a clear message.
         if cached_rows is not None and len(cached_rows) == len(texts) \
                 and recorded_total == len(texts):
             per_chunk = [([tuple(span) for span in row] if row is not None
@@ -435,17 +396,8 @@ def main() -> None:
                     _maybe_checkpoint(name, start, batch_indices, indices)
                 return
 
-            # FIX: GLiNER truncates anything over ~384 of its own internal
-            # tokens (see gliner_windows() docstring) -- several of this
-            # corpus's chunks measured well over that. Expand each chunk
-            # into one or more windows FIRST, batch over WINDOWS (not
-            # chunks) so batch size stays predictable regardless of how
-            # much splitting individual chunks need, then merge each
-            # window's entities back into its originating chunk with
-            # offsets corrected to the ORIGINAL chunk text -- relation_type()
-            # downstream reads spans against `texto`, the untouched chunk,
-            # not the window.
-            flat: list[tuple[int, str, int]] = []      # (chunk_idx, window_text, char_offset)
+
+            flat: list[tuple[int, str, int]] = []      
             for i in indices:
                 for window_text, offset in gliner_windows(texts[i]):
                     flat.append((i, window_text, offset))
@@ -454,21 +406,6 @@ def main() -> None:
                       f"{len(flat)} GLiNER windows (some chunks exceed "
                       f"the ~384-token limit)")
 
-            # `touched`: chunks already written to earlier in THIS PHASE
-            # CALL. A chunk long enough to need windowing can have its
-            # windows land in DIFFERENT batches whenever the flattened
-            # window list crosses an args.batch_size boundary -- grouping
-            # by `by_chunk` only merges windows that share one batch, not
-            # windows split across two. Without this set, the batch
-            # containing a chunk's LATER window would overwrite
-            # per_chunk[idx] via `_accumulate(..., append_only)`, silently
-            # discarding the earlier window's entities -- the same kind of
-            # loss this whole windowing fix exists to prevent, just moved
-            # from "truncated by GLiNER" to "overwritten at a batch
-            # boundary". Once a chunk has been written to at all in this
-            # phase, every subsequent batch touching it must MERGE,
-            # regardless of what `append_only` (which governs merging
-            # against an EARLIER PHASE's results, e.g. --fuse) says.
             touched: set[int] = set()
 
             for start in range(0, len(flat), args.batch_size):
@@ -558,14 +495,6 @@ def main() -> None:
 
         checkpoint()
 
-    # FIX: re-apply --max-entities-per-chunk unconditionally, whether
-    # per_chunk came from a full cache reuse or a fresh/resumed run.
-    # LOWERING the cap on an already-complete cache is free (span order
-    # per chunk is deterministic, so re-slicing gives the identical result
-    # to having extracted with the lower cap from the start). RAISING it
-    # still needs --recompute-ner -- and so does --gliner-threshold in
-    # either direction, since GLiNER applies that at extraction time, not
-    # here.
     over_cap = sum(1 for f in per_chunk if len(f) > args.max_entities_per_chunk)
     if over_cap:
         per_chunk = [f[:args.max_entities_per_chunk] for f in per_chunk]
