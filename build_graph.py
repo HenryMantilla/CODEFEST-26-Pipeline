@@ -168,6 +168,57 @@ _CAPITALISED = re.compile(
 _ACRONYM = re.compile(r"\b([A-ZÁÉÍÓÚÑ]{2,6})(?:[/\-][A-ZÁÉÍÓÚÑ]{2,6})?\b")
 
 
+def gliner_windows(text: str, max_words: int = 300,
+                   overlap_words: int = 40) -> list[tuple[str, int]]:
+    """
+    Split text into windows GLiNER can process without silently truncating.
+
+    GLiNER v2/v2.1 models hard-cap input at 384 of GLiNER's own internal
+    tokens -- not configurable at inference time in the released library
+    (github.com/urchade/GLiNER issues #113, #183, #275: this comes up
+    constantly and there is no supported way to raise it). Anything longer
+    is truncated WHERE THE TEXT IS CUT, not where entities are: a mention
+    in the back half of a long chunk becomes invisible to the model, with
+    only a UserWarning easy to miss in a long log, not an error.
+
+    300 words leaves real margin under 384 -- GLiNER's own counting is not
+    exactly whitespace-word count, so budgeting right up to the edge would
+    still risk truncation on punctuation- or numeral-heavy text.
+    `overlap_words` keeps a multi-word entity that happens to straddle a
+    window boundary from landing in neither window; the entity-identity
+    dedup downstream (identical (key, group) pairs collapse to one) means
+    the overlap costs a little redundant inference and nothing else.
+
+    Returns [(window_text, char_offset_into_original_text), ...]. A chunk
+    under the limit returns a single window with offset 0, so callers do
+    not need a separate short-text path.
+    """
+    words = text.split()
+    if len(words) <= max_words:
+        return [(text, 0)]
+
+    word_starts: list[int] = []
+    pos = 0
+    for w in words:
+        idx = text.index(w, pos)
+        word_starts.append(idx)
+        pos = idx + len(w)
+
+    windows: list[tuple[str, int]] = []
+    step = max(1, max_words - overlap_words)
+    start = 0
+    while start < len(words):
+        end = min(start + max_words, len(words))
+        char_start = word_starts[start]
+        char_end = (word_starts[end - 1] + len(words[end - 1])
+                   if end > 0 else len(text))
+        windows.append((text[char_start:char_end], char_start))
+        if end == len(words):
+            break
+        start += step
+    return windows
+
+
 def heuristic_entities(text: str) -> list[tuple[str, str, int, int]]:
     found: list[tuple[str, str, int, int]] = []
     for match in _ACRONYM.finditer(text):
@@ -211,7 +262,31 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--min-entity-freq", type=int, default=3)
     parser.add_argument("--max-entity-frac", type=float, default=0.02)
-    parser.add_argument("--max-entities-per-chunk", type=int, default=12)
+    parser.add_argument("--max-entities-per-chunk", type=int, default=12,
+                        help="Applied twice: once at extraction time and "
+                             "again every run after cache load. LOWERING "
+                             "this on an already-cached run re-prunes for "
+                             "free; RAISING it needs --recompute-ner.")
+    parser.add_argument("--min-edge-weight", type=int, default=1,
+                        help="Bare co-occurrence edges ('coocurre_con') "
+                             "seen fewer than this many times are dropped. "
+                             "Edges with a real verb-derived relation type "
+                             "are never dropped by this, regardless of "
+                             "weight. Default 1 = no pruning.")
+    parser.add_argument("--gliner-threshold", type=float, default=0.35,
+                        help="Confidence floor for a GLiNER span to be kept "
+                             "at all -- this is the single biggest lever on "
+                             "entity COUNT with a zero-shot model: lower "
+                             "means more recall and more noise, higher "
+                             "means fewer, more confident spans. Was "
+                             "hardcoded to 0.35 with no way to test "
+                             "alternatives. UNLIKE --max-entities-per-chunk, "
+                             "this is NOT cheap to re-sweep on a cached run "
+                             "-- GLiNER applies it at extraction time, so "
+                             "the cache only ever contains spans that "
+                             "already cleared the threshold used when it "
+                             "was built. Changing this always needs "
+                             "--recompute-ner in either direction.")
     parser.add_argument("--cache", type=Path, default=None)
     parser.add_argument("--recompute-ner", action="store_true")
     parser.add_argument("--hub-allowlist", type=Path, default=None)
@@ -262,10 +337,34 @@ def main() -> None:
             cached_rows = [json.loads(l) for l in
                           cache_path.read_text(encoding="utf-8").split("\n")
                           if l.strip()]
+        except Exception:
+            cached_rows = None
+
+        recorded_total = None
+        if meta_path.exists():
+            try:
+                recorded_total = json.loads(
+                    meta_path.read_text(encoding="utf-8")).get("total")
+            except Exception:
+                pass
+
+        # FIX: restore the length/total check dropped in the GLiNER
+        # rewrite. Without it, a cache built with a different --limit, a
+        # different corpus, or before a rebuild silently gets zipped
+        # against the current `texts` regardless of length -- and if it is
+        # SHORTER than the current corpus, `pending = [i for i in
+        # range(len(texts)) if per_chunk[i] is None]` below indexes past
+        # the end of a `per_chunk` that was replaced wholesale by the
+        # cached rows, raising IndexError deep into a run instead of
+        # failing fast with a clear message.
+        if cached_rows is not None and len(cached_rows) == len(texts) \
+                and recorded_total == len(texts):
             per_chunk = [([tuple(span) for span in row] if row is not None
                          else None) for row in cached_rows]
-        except Exception:
-            pass
+        elif cached_rows is not None:
+            print(f"  cache at {cache_path} does not match this corpus "
+                  f"({len(cached_rows)} rows vs {len(texts)} chunks, or no "
+                  f"matching recorded total) -- stale, recomputing.")
 
     done_count = sum(1 for row in per_chunk if row is not None)
 
@@ -324,53 +423,115 @@ def main() -> None:
                 {"ner": active_models, "total": len(texts)}), encoding="utf-8")
 
         def process_phase(name: str, ner, indices: list[int], append_only: bool) -> None:
-            for start in range(0, len(indices), args.batch_size):
-                batch_indices = indices[start:start + args.batch_size]
-                batch_texts = [texts[i] for i in batch_indices]
+            if ner is None:
+                # Heuristic mode has no token limit -- process chunks
+                # directly, one GLiNER-shaped step per chunk.
+                for start in range(0, len(indices), args.batch_size):
+                    batch_indices = indices[start:start + args.batch_size]
+                    spans_batch = [heuristic_entities(texts[i])
+                                  for i in batch_indices]
+                    for idx, spans in zip(batch_indices, spans_batch):
+                        _accumulate(idx, spans, None, append_only)
+                    _maybe_checkpoint(name, start, batch_indices, indices)
+                return
 
-                if ner is not None:
-                    try:
-                        # Fast batch inference for newer gliner versions
-                        raw_batch = ner.batch_predict_entities(batch_texts, TARGET_LABELS, threshold=0.35)
-                    except AttributeError:
-                        # Fallback iterator for older gliner versions
-                        raw_batch = [ner.predict_entities(t, TARGET_LABELS, threshold=0.35) for t in batch_texts]
-                        
-                    spans_batch = []
-                    for spans in raw_batch:
-                        chunk_spans = []
-                        for s in spans:
-                            group = GLINER_LABEL_MAP.get(s["label"].lower(), "MISC")
-                            chunk_spans.append((str(s["text"]).strip(), group, int(s["start"]), int(s["end"])))
-                        spans_batch.append(chunk_spans)
-                else:
-                    spans_batch = [heuristic_entities(t) for t in batch_texts]
+            # FIX: GLiNER truncates anything over ~384 of its own internal
+            # tokens (see gliner_windows() docstring) -- several of this
+            # corpus's chunks measured well over that. Expand each chunk
+            # into one or more windows FIRST, batch over WINDOWS (not
+            # chunks) so batch size stays predictable regardless of how
+            # much splitting individual chunks need, then merge each
+            # window's entities back into its originating chunk with
+            # offsets corrected to the ORIGINAL chunk text -- relation_type()
+            # downstream reads spans against `texto`, the untouched chunk,
+            # not the window.
+            flat: list[tuple[int, str, int]] = []      # (chunk_idx, window_text, char_offset)
+            for i in indices:
+                for window_text, offset in gliner_windows(texts[i]):
+                    flat.append((i, window_text, offset))
+            if len(flat) > len(indices):
+                print(f"  [{name}] {len(indices)} chunks expanded to "
+                      f"{len(flat)} GLiNER windows (some chunks exceed "
+                      f"the ~384-token limit)")
 
-                for idx, spans in zip(batch_indices, spans_batch):
-                    found = []
-                    for word, group, span_start, span_end in spans:
-                        if ner is not None and group not in KEEP_TYPES:
-                            continue
-                        if len(word) < 3 or word.isdigit():
-                            continue
-                        key = normalize_entity(word)
-                        if not key or len(key) < 3 or key in _NOT_ENTITY \
-                                or key in _CAPTION_ARTEFACTS \
-                                or any(key.startswith(a + " ") for a in ("see", "ver")):
-                            continue
-                        found.append((key, group, span_start, span_end))
+            # `touched`: chunks already written to earlier in THIS PHASE
+            # CALL. A chunk long enough to need windowing can have its
+            # windows land in DIFFERENT batches whenever the flattened
+            # window list crosses an args.batch_size boundary -- grouping
+            # by `by_chunk` only merges windows that share one batch, not
+            # windows split across two. Without this set, the batch
+            # containing a chunk's LATER window would overwrite
+            # per_chunk[idx] via `_accumulate(..., append_only)`, silently
+            # discarding the earlier window's entities -- the same kind of
+            # loss this whole windowing fix exists to prevent, just moved
+            # from "truncated by GLiNER" to "overwritten at a batch
+            # boundary". Once a chunk has been written to at all in this
+            # phase, every subsequent batch touching it must MERGE,
+            # regardless of what `append_only` (which governs merging
+            # against an EARLIER PHASE's results, e.g. --fuse) says.
+            touched: set[int] = set()
 
-                    if append_only and per_chunk[idx] is not None:
-                        per_chunk[idx] = per_chunk[idx] + found
-                    else:
-                        per_chunk[idx] = found
+            for start in range(0, len(flat), args.batch_size):
+                batch = flat[start:start + args.batch_size]
+                batch_texts = [w for _i, w, _o in batch]
+                try:
+                    raw_batch = ner.batch_predict_entities(
+                        batch_texts, TARGET_LABELS,
+                        threshold=args.gliner_threshold)
+                except AttributeError:
+                    raw_batch = [ner.predict_entities(
+                        t, TARGET_LABELS, threshold=args.gliner_threshold)
+                        for t in batch_texts]
 
+                # Group window results back by chunk WITHIN this batch --
+                # merging across batches is `touched`'s job, not this
+                # dict's.
+                by_chunk: dict[int, list] = defaultdict(list)
+                for (idx, _w, offset), spans in zip(batch, raw_batch):
+                    for s in spans:
+                        group = GLINER_LABEL_MAP.get(s["label"].lower(), "MISC")
+                        by_chunk[idx].append(
+                            (str(s["text"]).strip(), group,
+                             int(s["start"]) + offset, int(s["end"]) + offset))
+
+                for idx in {i for i, _w, _o in batch}:
+                    merge = append_only or (idx in touched)
+                    _accumulate(idx, by_chunk.get(idx, []), ner, merge)
+                    touched.add(idx)
+
+                done_chunks = len({i for i, _w, _o in flat[:start + len(batch)]})
                 batch_no = start // args.batch_size
                 if batch_no % CHECKPOINT_BATCHES == 0:
                     checkpoint()
-                    print(f"  [{name}] ... "
-                          f"{min(start + args.batch_size, len(indices))}/"
-                          f"{len(indices)}  (checkpointed)", flush=True)
+                    print(f"  [{name}] ... {done_chunks}/{len(indices)} "
+                          f"chunks  (checkpointed)", flush=True)
+
+        def _accumulate(idx: int, spans, ner, append_only: bool) -> None:
+            found = []
+            for word, group, span_start, span_end in spans:
+                if ner is not None and group not in KEEP_TYPES:
+                    continue
+                if len(word) < 3 or word.isdigit():
+                    continue
+                key = normalize_entity(word)
+                if not key or len(key) < 3 or key in _NOT_ENTITY \
+                        or key in _CAPTION_ARTEFACTS \
+                        or any(key.startswith(a + " ") for a in ("see", "ver")):
+                    continue
+                found.append((key, group, span_start, span_end))
+
+            if append_only and per_chunk[idx] is not None:
+                per_chunk[idx] = per_chunk[idx] + found
+            else:
+                per_chunk[idx] = found
+
+        def _maybe_checkpoint(name, start, batch_indices, indices) -> None:
+            batch_no = start // args.batch_size
+            if batch_no % CHECKPOINT_BATCHES == 0:
+                checkpoint()
+                print(f"  [{name}] ... "
+                      f"{min(start + args.batch_size, len(indices))}/"
+                      f"{len(indices)}  (checkpointed)", flush=True)
 
         try:
             for name, ner, indices, append_only in plan:
@@ -393,9 +554,24 @@ def main() -> None:
                 if entry[0] in seen_keys: continue
                 seen_keys.add(entry[0])
                 deduped.append(entry)
-            per_chunk[i] = deduped[:args.max_entities_per_chunk]
+            per_chunk[i] = deduped
 
         checkpoint()
+
+    # FIX: re-apply --max-entities-per-chunk unconditionally, whether
+    # per_chunk came from a full cache reuse or a fresh/resumed run.
+    # LOWERING the cap on an already-complete cache is free (span order
+    # per chunk is deterministic, so re-slicing gives the identical result
+    # to having extracted with the lower cap from the start). RAISING it
+    # still needs --recompute-ner -- and so does --gliner-threshold in
+    # either direction, since GLiNER applies that at extraction time, not
+    # here.
+    over_cap = sum(1 for f in per_chunk if len(f) > args.max_entities_per_chunk)
+    if over_cap:
+        per_chunk = [f[:args.max_entities_per_chunk] for f in per_chunk]
+        print(f"  --max-entities-per-chunk {args.max_entities_per_chunk}: "
+              f"re-pruned {over_cap} chunks from the cached spans "
+              f"(no NER recompute needed)")
 
     frequency: Counter = Counter()
     for found in per_chunk:
@@ -465,17 +641,66 @@ def main() -> None:
                        chunks=" ".join(sorted(chunk_ids)),
                        frecuencia=frequency[entity])
 
+    # FIX: kept entities broken down by type. With GLINER_LABEL_MAP,
+    # 'treaty or accord' and 'technology or system' both collapse to MISC
+    # -- worth seeing this printed rather than assumed, especially since
+    # this is the first real run with the new zero-shot labels.
+    type_counts = Counter(labels.get(e, "MISC") for e in entity_chunks)
+    print(f"  kept entities by tipo: " +
+          ", ".join(f"{t}={n}" for t, n in type_counts.most_common()))
+    if type_counts.get("MISC", 0) > sum(type_counts.values()) * 0.4:
+        used_gliner = False
+        if meta_path.exists():
+            try:
+                used_gliner = "gliner" in json.loads(
+                    meta_path.read_text(encoding="utf-8")).get("ner", "").lower()
+            except Exception:
+                pass
+        if used_gliner:
+            print(f"  MISC is {type_counts['MISC'] / sum(type_counts.values()):.0%} "
+                  f"of kept entities. With GLiNER this usually means "
+                  f"--gliner-threshold is too low (letting through low-"
+                  f"confidence 'treaty or accord'/'technology or system' "
+                  f"matches) rather than a labeling problem -- try raising it "
+                  f"a notch and comparing entity counts before assuming the "
+                  f"label map itself needs changing.")
+        else:
+            print(f"  MISC is {type_counts['MISC'] / sum(type_counts.values()):.0%} "
+                  f"of kept entities. The heuristic extractor labels EVERY "
+                  f"capitalised-run match MISC by construction (see "
+                  f"heuristic_entities()) -- this is expected in --ner "
+                  f"heuristic, not a signal that something is wrong.")
+
+    dropped_edges = 0
     for (a, b), evidence in edge_evidence.items():
         types = Counter(label for label, _c, _d in evidence)
-        graph.add_edge(a, b, relacion=types.most_common(1)[0][0], peso=len(evidence),
+        top_label = types.most_common(1)[0][0]
+        weight = len(evidence)
+        # FIX: keep every TYPED edge regardless of weight; only prune bare
+        # co-occurrence ('coocurre_con') edges below --min-edge-weight. A
+        # single 'controla'/'opera_en' sighting is real linguistic
+        # evidence; a single same-chunk co-occurrence is the weakest
+        # signal the graph produces.
+        if top_label == "coocurre_con" and weight < args.min_edge_weight:
+            dropped_edges += 1
+            continue
+        graph.add_edge(a, b, relacion=top_label, peso=weight,
                        chunks=" ".join(sorted({c for _l, c, _d in evidence})[:40]),
                        docs=" ".join(sorted({d for _l, _c, d in evidence})[:20]))
+
+    if args.min_edge_weight > 1:
+        print(f"  --min-edge-weight {args.min_edge_weight}: dropped "
+              f"{dropped_edges} single-mention co-occurrence edges "
+              f"(typed relations kept regardless of weight)")
 
     out.parent.mkdir(parents=True, exist_ok=True)
     nx.write_graphml(graph, out)
 
+    typed = sum(1 for _a, _b, d in graph.edges(data=True)
+                if d["relacion"] != "coocurre_con")
     print(f"\nWrote {out}")
-    print(f"  {graph.number_of_nodes()} entities, {graph.number_of_edges()} relations")
+    print(f"  {graph.number_of_nodes()} entities, {graph.number_of_edges()} "
+          f"relations ({typed} with a verb-derived type, the rest co-occurrence)")
 
 if __name__ == "__main__":
     main()
